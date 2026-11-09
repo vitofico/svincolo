@@ -1,0 +1,26 @@
+[graph]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+
+[advisories]
+version = 2
+
+[licenses]
+private = { ignore = true }
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

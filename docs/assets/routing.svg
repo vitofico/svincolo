@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="328" viewBox="0 0 1000 328" role="img" aria-labelledby="title desc">
+  <title id="title">How Svincolo routes requests</title>
+  <desc id="desc">A writing app's token permits the low and high routes. A search app's token permits the embeddings route. Svincolo checks the token and resolves the route to its pinned model. In this example, low goes to local chat, high goes to cloud chat, and embeddings goes to a local embedding model.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1 L 8 5 L 1 9" fill="none" stroke="#526781" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="998" height="326" rx="22" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="2"/>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+    <g fill="#3f526a" font-size="13" font-weight="700" letter-spacing="1.7">
+      <text x="36" y="42">APPLICATIONS</text>
+      <text x="358" y="42">ROUTER</text>
+      <text x="700" y="42">PINNED MODELS</text>
+    </g>
+
+    <g fill="none" stroke="#526781" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M 300 118 H 346"/>
+      <path d="M 300 216 H 346"/>
+      <path d="M 642 100 H 688"/>
+      <path d="M 642 168 H 688"/>
+      <path d="M 642 236 H 688"/>
+    </g>
+
+    <g fill="#ffffff" stroke="#cbd5e1">
+      <rect x="36" y="80" width="264" height="76" rx="12"/>
+      <rect x="36" y="178" width="264" height="76" rx="12"/>
+      <rect x="700" y="71" width="264" height="58" rx="12"/>
+      <rect x="700" y="139" width="264" height="58" rx="12"/>
+      <rect x="700" y="207" width="264" height="58" rx="12"/>
+    </g>
+
+    <g fill="#172b43" font-size="18" font-weight="700">
+      <text x="54" y="111">Writing app</text>
+      <text x="54" y="209">Search app</text>
+    </g>
+    <g fill="#3f526a" font-size="14">
+      <text x="54" y="135">Token permits low and high</text>
+      <text x="54" y="233">Token permits embeddings</text>
+    </g>
+
+    <rect x="358" y="71" width="284" height="194" rx="16" fill="#132d43"/>
+    <text x="381" y="116" fill="#ffffff" font-size="31" font-weight="750">Svincolo</text>
+    <path d="M 381 134 H 619" stroke="#456278"/>
+    <g fill="#b5f3dc">
+      <circle cx="391" cy="159" r="10"/>
+      <circle cx="391" cy="192" r="10"/>
+      <circle cx="391" cy="225" r="10"/>
+    </g>
+    <g fill="#132d43" font-size="12" font-weight="750" text-anchor="middle">
+      <text x="391" y="163">1</text>
+      <text x="391" y="196">2</text>
+      <text x="391" y="229">3</text>
+    </g>
+    <g fill="#eef5fb" font-size="15">
+      <text x="411" y="164">Check token and route access</text>
+      <text x="411" y="197">Resolve the model alias</text>
+      <text x="411" y="230">Add provider key if configured</text>
+    </g>
+
+    <g fill="#116149" font-size="16" font-weight="700" font-family="ui-monospace, 'SFMono-Regular', Consolas, monospace">
+      <text x="718" y="94">low</text>
+      <text x="718" y="162">high</text>
+      <text x="718" y="230">embeddings</text>
+    </g>
+    <g fill="#3f526a" font-size="14">
+      <text x="718" y="115">Local chat model</text>
+      <text x="718" y="183">Cloud chat model</text>
+      <text x="718" y="251">Local embedding model</text>
+    </g>
+    <text x="36" y="302" fill="#3f526a" font-size="14">Example routes and permissions for two apps</text>
+  </g>
+</svg>

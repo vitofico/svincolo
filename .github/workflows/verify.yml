@@ -1,0 +1,124 @@
+name: Verify Svincolo
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "26 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.event_name == 'schedule' && 'daily' || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned dependency checks
+        run: |
+          set -euo pipefail
+          directory=$(mktemp -d)
+          bin="$RUNNER_TEMP/audit-bin"
+          mkdir -p "$bin"
+          cd "$directory"
+          deny=cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          audit=cargo-audit-x86_64-unknown-linux-musl-v0.22.2.tgz
+          curl -fsSL --retry 3 -o "$deny" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$deny"
+          curl -fsSL --retry 3 -o "$audit" "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v0.22.2/$audit"
+          printf '%s  %s\n' \
+            9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f "$deny" \
+            7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428 "$audit" | sha256sum -c -
+          tar -xzf "$deny"
+          tar -xzf "$audit"
+          install "${deny%.tar.gz}/cargo-deny" "${audit%.tgz}/cargo-audit" "$bin/"
+          printf '%s\n' "$bin" >> "$GITHUB_PATH"
+          cd /
+          rm -rf "$directory"
+      - run: cargo deny --locked check
+      - run: cargo audit --file Cargo.lock --deny warnings
+
+  images:
+    if: github.event_name != 'schedule'
+    needs: [rust, dependencies]
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and verify the OCI archive and scratch image
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/review"
+          mkdir -p "$evidence"
+          docker buildx create --name svincolo-ci --driver docker-container \
+            --driver-opt image=moby/buildkit@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+          tag="svincolo:review-${GITHUB_SHA:0:12}-$ARCH"
+          platform="linux/$ARCH"
+          archive="$evidence/svincolo-$ARCH.oci.tar"
+          build() {
+            docker buildx build --builder svincolo-ci --platform "$platform" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --tag "$tag" "$@" .
+          }
+          build --provenance=mode=min,version=v1 \
+            --sbom=generator=docker/buildkit-syft-scanner@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315 \
+            --output "type=oci,dest=$archive"
+          python3 scripts/check-oci.py "$archive" "$ARCH" "$GITHUB_SHA" "$evidence" | tee "$evidence/oci-check.txt"
+          build --provenance=false --sbom=false --load
+          sh scripts/check-image.sh "$tag" "$platform" "$GITHUB_SHA" "$evidence/svincolo"
+      - name: Check release transport and performance budgets
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/review"
+          python3 "$GITHUB_WORKSPACE/scripts/stress-image.py" ./svincolo | tee stress.json
+          sha256sum svincolo "svincolo-$ARCH.oci.tar" sbom.spdx.json provenance.intoto.json stress.json > SHA256SUMS
+      - name: Check full TLS release capacity
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          ulimit -Sn 65536
+          evidence="$RUNNER_TEMP/review"
+          SVINCOLO_TEST_BIN="$evidence/svincolo" cargo test --locked --test tls_transport \
+            tls_release_capacity -- --ignored --exact --nocapture | tee "$evidence/tls-stress.log"
+          (cd "$evidence" && sha256sum tls-stress.log >> SHA256SUMS)
+      - name: Store candidate for review
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: svincolo-review-${{ matrix.arch }}
+          path: ${{ runner.temp }}/review/
+          if-no-files-found: error
+          retention-days: 7
