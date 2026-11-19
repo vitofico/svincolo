@@ -44,7 +44,27 @@ enum Validation {
 #[derive(Default)]
 pub struct Report {
     pub attempts: u8,
+    pub known_attempts: u8,
     pub mode: Option<StructuredMode>,
+    usage: Usage,
+}
+
+impl Report {
+    pub fn usage_tokens(&self) -> [u64; 4] {
+        [
+            self.usage.input_tokens,
+            self.usage.cache_read_input_tokens,
+            self.usage.cache_creation_input_tokens,
+            self.usage.output_tokens,
+        ]
+    }
+
+    fn record_usage(&mut self, dialect: ManagedDialect, raw: &[u8]) {
+        if let Some(usage) = Usage::reported(dialect, raw) {
+            self.known_attempts += 1;
+            self.usage.add(&usage);
+        }
+    }
 }
 
 pub struct ManagedError {
@@ -416,19 +436,16 @@ impl Prepared {
             })?;
             report.mode = mode;
             let surface = self.dialect.upstream_surface();
-            let response = match upstream::forward(target, surface, body, admission).await {
-                Ok(response) => {
-                    report.attempts += 1;
-                    response
-                }
-                Err(mut failure) => {
-                    if report.attempts > 0 && failure.reached == "false" {
-                        failure.reached = "true";
-                    }
-                    report.attempts += u8::from(failure.attempted);
-                    return Err(failure.into());
-                }
-            };
+            let prior_attempts = report.attempts;
+            let response =
+                upstream::forward(target, surface, body, admission, &mut report.attempts)
+                    .await
+                    .map_err(|mut failure| {
+                        if prior_attempts > 0 && failure.reached == "false" {
+                            failure.reached = "true";
+                        }
+                        failure
+                    })?;
             let (parts, body) = response.into_parts();
             if !parts.status.is_success() {
                 if !no_retry
@@ -442,6 +459,7 @@ impl Prepared {
                     let body = to_bytes(body, MAX_BODY_BYTES)
                         .await
                         .map_err(|_| protocol())?;
+                    report.record_usage(self.dialect, &body);
                     if format_refusal(self.dialect, &body) {
                         mode_index += 1;
                         continue;
@@ -454,6 +472,7 @@ impl Prepared {
             let raw = to_bytes(body, MAX_BODY_BYTES)
                 .await
                 .map_err(|_| protocol())?;
+            report.record_usage(self.dialect, &raw);
             let answer = Answer::decode(self.dialect, &raw)?;
             usage.add(&answer.usage);
             let text = &answer.text;
@@ -638,6 +657,41 @@ struct Usage {
 }
 
 impl Usage {
+    fn reported(dialect: ManagedDialect, raw: &[u8]) -> Option<Self> {
+        // Billing requires explicit core counts. The client response still uses
+        // the provider-specific decoder's legacy defaults.
+        #[derive(Deserialize)]
+        struct Envelope<T> {
+            usage: T,
+        }
+
+        match dialect {
+            ManagedDialect::Anthropic => {
+                let Envelope { usage } =
+                    serde_json::from_slice::<Envelope<NativeUsage>>(raw).ok()?;
+                Some(Self {
+                    input_tokens: usage.input_tokens,
+                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                    output_tokens: usage.output_tokens,
+                })
+            }
+            ManagedDialect::Openai | ManagedDialect::Ollama => {
+                let Envelope { usage } = serde_json::from_slice::<Envelope<ChatUsage>>(raw).ok()?;
+                let details = usage.prompt_tokens_details.unwrap_or_default();
+                Some(Self {
+                    input_tokens: usage
+                        .prompt_tokens
+                        .checked_sub(details.cached_tokens)?
+                        .checked_sub(details.cache_write_tokens)?,
+                    cache_read_input_tokens: details.cached_tokens,
+                    cache_creation_input_tokens: details.cache_write_tokens,
+                    output_tokens: usage.completion_tokens,
+                })
+            }
+        }
+    }
+
     fn add(&mut self, other: &Self) {
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.cache_read_input_tokens = self
@@ -663,6 +717,16 @@ impl Usage {
 }
 
 #[derive(Deserialize)]
+struct NativeUsage {
+    input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    output_tokens: u64,
+}
+
+#[derive(Deserialize)]
 struct NativeAnswer {
     id: String,
     model: String,
@@ -684,7 +748,7 @@ struct ChatAnswer {
     model: String,
     created: Option<u64>,
     choices: Vec<ChatChoice>,
-    usage: Option<ChatUsage>,
+    usage: Option<LegacyChatUsage>,
 }
 
 #[derive(Deserialize)]
@@ -701,10 +765,24 @@ struct ChatMessage {
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
-struct ChatUsage {
+struct LegacyChatUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
     prompt_tokens_details: Option<CachedTokens>,
+}
+
+#[derive(Deserialize)]
+struct ChatUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    prompt_tokens_details: Option<ChatUsageDetails>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ChatUsageDetails {
+    cached_tokens: u64,
+    cache_write_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -837,7 +915,6 @@ fn local(status: StatusCode, code: &'static str, message: &'static str) -> Failu
         code,
         message,
         reached: "false",
-        attempted: false,
         retry_after: None,
     }
 }
@@ -848,7 +925,6 @@ fn reached(status: StatusCode, code: &'static str, message: &'static str) -> Fai
         code,
         message,
         reached: "true",
-        attempted: true,
         retry_after: None,
     }
 }
@@ -879,4 +955,70 @@ fn protocol() -> Failure {
         "upstream_protocol_error",
         "The native provider returned an unusable response.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_accumulates_disjoint_counts_from_each_provider() {
+        let mut report = Report::default();
+        report.record_usage(
+            ManagedDialect::Anthropic,
+            br#"{"usage":{"input_tokens":4,"cache_read_input_tokens":2,
+                "cache_creation_input_tokens":3,"output_tokens":1}}"#,
+        );
+        report.record_usage(
+            ManagedDialect::Openai,
+            br#"{"usage":{"prompt_tokens":8,"completion_tokens":5,
+                "prompt_tokens_details":{"cached_tokens":5,"cache_write_tokens":2}}}"#,
+        );
+        report.record_usage(
+            ManagedDialect::Anthropic,
+            br#"{"usage":{"input_tokens":0,"output_tokens":0}}"#,
+        );
+        report.record_usage(
+            ManagedDialect::Ollama,
+            br#"{"usage":{"prompt_tokens":2,"completion_tokens":1}}"#,
+        );
+        assert_eq!(report.known_attempts, 4);
+        assert_eq!(report.usage_tokens(), [7, 7, 5, 7]);
+    }
+
+    #[test]
+    fn report_counts_only_attempts_with_valid_usage() {
+        let mut report = Report::default();
+        for raw in [
+            br#"{}"#.as_slice(),
+            br#"{"usage":null}"#,
+            br#"{"usage":{"prompt_tokens":5}}"#,
+            br#"{"usage":{"prompt_tokens":5,"completion_tokens":-1}}"#,
+            br#"{"usage":{"prompt_tokens":5,"completion_tokens":2,
+                "prompt_tokens_details":{"cached_tokens":6}}}"#,
+            br#"{"usage":{"prompt_tokens":5,"completion_tokens":2,
+                "prompt_tokens_details":{"cached_tokens":3,"cache_write_tokens":3}}}"#,
+        ] {
+            report.record_usage(ManagedDialect::Openai, raw);
+        }
+        for raw in [
+            br#"{"usage":{"output_tokens":2}}"#.as_slice(),
+            br#"{"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":"3"}}"#,
+        ] {
+            report.record_usage(ManagedDialect::Anthropic, raw);
+        }
+        assert_eq!(report.known_attempts, 0);
+        assert_eq!(report.usage_tokens(), [0; 4]);
+    }
+
+    #[test]
+    fn missing_openai_usage_still_returns_a_legacy_zero_usage_completion() {
+        let raw = br#"{"id":"chat","model":"model","choices":[
+            {"finish_reason":"stop","message":{"content":"ok"}}]}"#;
+        let answer = Answer::decode(ManagedDialect::Openai, raw)
+            .unwrap_or_else(|_| panic!("OpenAI completion should decode without usage"));
+        assert_eq!(answer.text, "ok");
+        assert_eq!(answer.usage.json()["total_tokens"], 0);
+        assert!(Usage::reported(ManagedDialect::Openai, raw).is_none());
+    }
 }

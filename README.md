@@ -97,6 +97,10 @@ See the [configuration and operations guide](docs/configuration.md) for
 provider examples, managed output, limits, key rotation, and TLS. The
 [Kubernetes canary guide](deploy/k8s/README.md) shows an isolated deployment.
 
+The [operator cost report](docs/cost-report.md) estimates monthly token spend by
+app and model for managed chat, native Messages and Responses, embeddings, and audio transcriptions. Its
+dashboard shows API usage, each app’s share of spend, and pricing coverage.
+
 Run the mock-provider suite with `cargo test --locked` to check routing,
 caller-scoped discovery, native Messages forwarding, and transport behavior.
 Native Linux CI also checks both image targets and runs the transport load test.

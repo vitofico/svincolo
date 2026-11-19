@@ -118,10 +118,18 @@ struct Fixture {
     calls: mpsc::UnboundedReceiver<Seen>,
     client: reqwest::Client,
     base_url: String,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
 }
 
 impl Fixture {
+    fn events(&self, kind: &str) -> Vec<Value> {
+        let log = fs::read_to_string(self.directory.path().join("router.log")).unwrap();
+        log.lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["event"] == kind)
+            .collect()
+    }
+
     async fn start(reply: Reply, version: Option<&str>) -> Self {
         Self::start_with_rate(reply, version, "").await
     }
@@ -206,7 +214,7 @@ default_max_tokens = 1024
 name = "chat-test"
 upstream = "chat"
 locality = "local"
-surfaces = {{ chat = "raw" }}
+surfaces = {{ chat = "raw", responses = "raw", embeddings = "raw", transcriptions = "raw" }}
 
 [[route]]
 name = "openai-managed"
@@ -244,7 +252,7 @@ routes = ["claude-test", "chat-test", "claude-managed", "openai-managed", "ollam
         let router = Command::new(env!("CARGO_BIN_EXE_svincolo"))
             .args(["serve", "--config"])
             .arg(config)
-            .stdout(Stdio::null())
+            .stdout(fs::File::create(directory.path().join("router.log")).unwrap())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
@@ -258,7 +266,7 @@ routes = ["claude-test", "chat-test", "claude-managed", "openai-managed", "ollam
                 .build()
                 .unwrap(),
             base_url: String::new(),
-            _directory: directory,
+            directory,
         };
 
         let stderr = fixture.router.stderr.take().unwrap();
@@ -399,6 +407,115 @@ async fn streams_native_events_and_supplies_default_version() {
 }
 
 #[tokio::test]
+async fn native_json_keeps_wire_body_and_records_usage_once_per_dispatch() {
+    for (path, route, surface, reported) in [
+        (
+            MESSAGES,
+            "claude-test",
+            "messages",
+            json!({"input_tokens":8,"cache_read_input_tokens":3,"cache_creation_input_tokens":2,"output_tokens":5}),
+        ),
+        (
+            "/v1/responses",
+            "chat-test",
+            "responses",
+            json!({"input_tokens":13,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2},"output_tokens":5}),
+        ),
+    ] {
+        let body = json!({"usage": reported, "content": "private response sentinel"});
+        let fixture = Fixture::start(script([(200, body.clone())]), None).await;
+        let response = fixture
+            .post(path)
+            .bearer_auth(CALLER_KEY)
+            .body(json!({"model":route,"input":"private request sentinel"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = response.headers()["x-svincolo-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(response.bytes().await.unwrap(), body.to_string());
+        let events = fixture.events("native_usage");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event["request_id"], id);
+        assert_eq!(event["surface"], surface);
+        assert_eq!(event["caller"], "test");
+        assert_eq!(event["attempts"], 1);
+        assert_eq!(event["known_attempts"], 1);
+        assert_eq!(event["input_tokens"], 8);
+        assert_eq!(event["cache_read_input_tokens"], 3);
+        assert_eq!(event["cache_creation_input_tokens"], 2);
+        assert_eq!(event["output_tokens"], 5);
+        assert!(!event.to_string().contains("sentinel"));
+    }
+}
+
+#[tokio::test]
+async fn embedding_and_transcription_cost_units_follow_native_responses() {
+    let embedding =
+        json!({"data":[{"embedding":[-0.8,0.2]}],"usage":{"prompt_tokens":7,"total_tokens":7}});
+    let transcript = json!({"text":"private transcript","usage":{"type":"duration","seconds":2.5}});
+    let fixture = Fixture::start(
+        script([
+            (200, embedding.clone()),
+            (200, transcript.clone()),
+            (200, json!({"text":"private transcript"})),
+        ]),
+        None,
+    )
+    .await;
+    let response = fixture
+        .post("/v1/embeddings")
+        .bearer_auth(CALLER_KEY)
+        .body(r#"{"model":"chat-test","input":["private input"]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.bytes().await.unwrap(), embedding.to_string());
+    let mut upload = b"--abc\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nchat-test\r\n--abc\r\nContent-Disposition: form-data; name=\"file\"; filename=\"clip.wav\"\r\nContent-Type: audio/wav\r\n\r\n".to_vec();
+    // One second of mono PCM at 8 kHz. The provider can report a different billed duration.
+    upload.extend(b"RIFF");
+    upload.extend(8036u32.to_le_bytes());
+    upload.extend(b"WAVEfmt ");
+    upload.extend(16u32.to_le_bytes());
+    upload.extend([1, 0, 1, 0]);
+    upload.extend(8000u32.to_le_bytes());
+    upload.extend(8000u32.to_le_bytes());
+    upload.extend([1, 0, 8, 0]);
+    upload.extend(b"data");
+    upload.extend(8000u32.to_le_bytes());
+    upload.extend([128; 8000]);
+    upload.extend(b"\r\n--abc--\r\n");
+    for expected in [transcript, json!({"text":"private transcript"})] {
+        let answer = fixture
+            .client
+            .post(format!("{}/v1/audio/transcriptions", fixture.base_url))
+            .bearer_auth(CALLER_KEY)
+            .header("content-type", "multipart/form-data; boundary=abc")
+            .body(upload.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.bytes().await.unwrap(), expected.to_string());
+    }
+    let events = fixture.events("native_usage");
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["surface"], "embeddings");
+    assert_eq!(events[0]["input_tokens"], 7);
+    assert_eq!(events[1]["surface"], "transcriptions");
+    assert_eq!(events[1]["audio_duration_ms"], 2500);
+    assert!(events[1].get("uploaded_audio_duration_ms").is_none());
+    assert_eq!(events[2]["uploaded_audio_duration_ms"], 1000);
+    for event in events {
+        assert_eq!(event["known_attempts"], 1);
+        assert!(!event.to_string().contains("private"));
+    }
+}
+
+#[tokio::test]
 async fn preserves_native_provider_error() {
     let mut fixture = Fixture::start(Reply::Error, None).await;
     let response = fixture
@@ -414,6 +531,9 @@ async fn preserves_native_provider_error() {
     assert_eq!(response.headers()["x-svincolo-origin"], "upstream");
     assert_eq!(response.headers()["x-svincolo-provider-reached"], "true");
     assert_eq!(response.bytes().await.unwrap(), NATIVE_ERROR);
+    let events = fixture.events("native_usage");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["known_attempts"], 0);
     fixture.seen().await;
     fixture.no_more_calls();
 }
@@ -537,6 +657,32 @@ async fn sent_json(fixture: &mut Fixture) -> Value {
 }
 
 #[tokio::test]
+async fn cancelled_managed_request_records_unknown_attempt() {
+    let mut fixture = Fixture::start(Reply::Stream(Arc::new(Notify::new())), None).await;
+    let request = fixture
+        .post("/v1/chat/completions")
+        .bearer_auth(CALLER_KEY)
+        .body(managed_body(closed_schema()).to_string());
+    let pending = tokio::spawn(request.send());
+    fixture.seen().await;
+    pending.abort();
+    let events = timeout(WAIT, async {
+        loop {
+            let events = fixture.events("managed_chat_usage");
+            if !events.is_empty() {
+                return events;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("usage event on cancellation");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["attempts"], 1);
+    assert_eq!(events[0]["known_attempts"], 0);
+}
+
+#[tokio::test]
 async fn managed_native_translates_and_repairs_with_original_schema() {
     let mut fixture = Fixture::start(
         script([
@@ -555,6 +701,25 @@ async fn managed_native_translates_and_repairs_with_original_schema() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let events = fixture.events("managed_chat_usage");
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event["caller"], "test");
+    assert_eq!(event["provider"], "claude");
+    assert_eq!(event["upstream_model"], "claude-test");
+    assert_eq!(
+        event["request_id"],
+        response.headers()["x-svincolo-request-id"]
+            .to_str()
+            .unwrap()
+    );
+    assert!(event["timestamp_s"].as_u64().unwrap() > 0);
+    assert_eq!(event["attempts"], 2);
+    assert_eq!(event["known_attempts"], 2);
+    assert_eq!(event["input_tokens"], 10);
+    assert_eq!(event["cache_read_input_tokens"], 4);
+    assert_eq!(event["cache_creation_input_tokens"], 2);
+    assert_eq!(event["output_tokens"], 6);
     assert_eq!(response.headers()["x-svincolo-structured-mode"], "native");
     assert_eq!(response.headers()["x-svincolo-attempts"], "2");
     assert_eq!(
@@ -959,6 +1124,12 @@ async fn managed_openai_falls_back_only_on_a_format_rejection_and_honors_no_retr
             );
         }
     }
+    let events = fixture.events("managed_chat_usage");
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0]["attempts"], 2);
+    assert_eq!(events[0]["known_attempts"], 1);
+    assert_eq!(events[1]["known_attempts"], 0);
+    assert_eq!(events[2]["known_attempts"], 0);
     fixture.no_more_calls();
 }
 

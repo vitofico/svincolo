@@ -40,6 +40,7 @@ use crate::{
     rate::{AttemptBudget, Rate},
     state::{self, Admission, Capacity, ReloadSignal, Reservation, Snapshot},
     upstream,
+    usage_log::{ManagedUsageEvent, NativeUsageEvent, UsageIdentity},
 };
 
 struct App {
@@ -48,6 +49,7 @@ struct App {
     budget: Arc<Capacity>,
     active: Arc<Capacity>,
     queue_bytes: Arc<Capacity>,
+    observation_budget: Arc<Capacity>,
     draining: watch::Sender<bool>,
 }
 
@@ -75,6 +77,7 @@ pub async fn serve(config: Config, path: PathBuf, inputs: FileInputs) -> Result<
         budget: Arc::new(Capacity::default()),
         active: Arc::new(Capacity::default()),
         queue_bytes: Arc::new(Capacity::default()),
+        observation_budget: Arc::new(Capacity::default()),
         current: watch::Sender::new(admission.snapshot(config, cloud)),
         draining: watch::Sender::new(false),
     });
@@ -432,10 +435,10 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
         Err(fault) => return meta.error(fault),
     };
     let parsed = match &boundary {
-        Some(boundary) => boundary.read_model(&body),
-        None => read_model(&body),
+        Some(boundary) => boundary.read_upload(&body),
+        None => read_model(&body).map(|model| (model, None)),
     };
-    let model = match parsed {
+    let (model, audio) = match parsed {
         Ok(model) => model,
         Err(ModelError::Invalid) => return meta.error(bad_body),
         Err(ModelError::Missing) => return meta.error(NO_ROUTE),
@@ -495,6 +498,13 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
         headers,
         query: parts.uri.query(),
     };
+    let mut native = (surface != Surface::Chat).then(|| {
+        NativeUsageEvent::new(
+            UsageIdentity::new(&meta.id, caller, route),
+            surface,
+            audio.and_then(crate::audio_duration::milliseconds),
+        )
+    });
     let dispatch = async {
         if let Some(settings) = settings {
             let no_retry = match single_header(headers, "x-svincolo-no-retry") {
@@ -521,12 +531,16 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
             };
             drop(body);
             meta.dropped_params = prepared.dropped_params.join(",");
-            let mut report = managed::Report::default();
+            let mut usage = ManagedUsageEvent {
+                identity: UsageIdentity::new(&meta.id, caller, route),
+                report: managed::Report::default(),
+            };
             let result = prepared
-                .run(&target, &mut admission, no_retry, &mut report)
+                .run(&target, &mut admission, no_retry, &mut usage.report)
                 .await;
-            meta.attempts = report.attempts;
-            meta.structured_mode = report.mode.map(|mode| mode.as_str());
+            meta.attempts = usage.report.attempts;
+            meta.structured_mode = usage.report.mode.map(|mode| mode.as_str());
+            drop(usage);
             match result {
                 Ok(mut response) => {
                     meta.write_headers(response.headers_mut(), "upstream", "true");
@@ -545,16 +559,22 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
                 Ok(outbound) => outbound,
                 Err(fault) => return meta.error(fault),
             };
-            match upstream::forward(&target, surface, body, &mut admission).await {
+            let attempts = native
+                .as_mut()
+                .map_or(&mut meta.attempts, |event| &mut event.attempts);
+            let result = upstream::forward(&target, surface, body, &mut admission, attempts).await;
+            if let Some(event) = &mut native {
+                meta.attempts = event.attempts;
+                if let Ok(response) = &result {
+                    event.observe(response, &app.observation_budget, config.max_buffered_bytes);
+                }
+            }
+            match result {
                 Ok(mut response) => {
-                    meta.attempts = 1;
                     meta.write_headers(response.headers_mut(), "upstream", "true");
                     response
                 }
-                Err(error) => {
-                    meta.attempts = u8::from(error.attempted);
-                    meta.error(error.into())
-                }
+                Err(error) => meta.error(error.into()),
             }
         }
     };
@@ -609,6 +629,7 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
             body,
             _slots: admission.slots,
             _working: working,
+            native,
             cloud_cancel: cloud.map(|token| Box::pin(token.clone().cancelled_owned())),
             request_id: meta.id,
         }),
@@ -830,6 +851,7 @@ struct ActiveResponse {
     body: Body,
     _slots: Slots,
     _working: Option<Reservation>,
+    native: Option<NativeUsageEvent>,
     cloud_cancel: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
     request_id: String,
 }
@@ -854,7 +876,19 @@ impl http_body::Body for ActiveResponse {
                 "stream cut by local-only policy",
             )))));
         }
-        Pin::new(&mut self.body).poll_frame(cx)
+        let frame = Pin::new(&mut self.body).poll_frame(cx);
+        if let Some(event) = &mut self.native {
+            match &frame {
+                Poll::Ready(Some(Ok(frame))) => {
+                    if let Some(data) = frame.data_ref() {
+                        event.feed(data);
+                    }
+                }
+                Poll::Ready(None) => event.finish(),
+                _ => {}
+            }
+        }
+        frame
     }
 
     fn is_end_stream(&self) -> bool {
