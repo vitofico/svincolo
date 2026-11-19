@@ -436,7 +436,6 @@ const fn refusal(
         message,
         retry_after: Some(retry_after),
         reached: "false",
-        attempted: false,
     }
 }
 
@@ -482,7 +481,6 @@ const DISCONNECTED: Failure = Failure {
     message: "The client closed the connection before provider dispatch.",
     retry_after: None,
     reached: "false",
-    attempted: false,
 };
 
 #[cfg(test)]

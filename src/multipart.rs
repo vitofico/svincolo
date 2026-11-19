@@ -33,22 +33,26 @@ impl Boundary {
         memmem::find(value.as_bytes(), &self.0).is_none()
     }
 
-    pub fn read_model(&self, body: &[u8]) -> Result<Model, ModelError> {
+    pub fn read_upload<'a>(&self, body: &'a [u8]) -> Result<(Model, Option<&'a [u8]>), ModelError> {
         self.scan(body, false)
     }
 
     pub fn read_model_prefix(&self, body: &[u8]) -> Option<String> {
-        self.scan(body, true).ok().map(|model| model.name)
+        self.scan(body, true).ok().map(|(model, _)| model.name)
     }
 
-    fn scan(&self, body: &[u8], prefix: bool) -> Result<Model, ModelError> {
+    fn scan<'a>(
+        &self,
+        body: &'a [u8],
+        prefix: bool,
+    ) -> Result<(Model, Option<&'a [u8]>), ModelError> {
         let delimiter = Finder::new(&self.0);
         let mut tail = body
             .strip_prefix(self.0.as_slice())
             .and_then(|tail| tail.strip_prefix(b"\r\n"))
             .ok_or(ModelError::Invalid)?;
         let mut model = None;
-        let mut file_seen = false;
+        let mut audio = None;
         for _ in 0..MAX_PARTS {
             let header_end = memmem::find(&tail[..tail.len().min(MAX_HEADERS)], b"\r\n\r\n")
                 .ok_or(ModelError::Invalid)?;
@@ -75,21 +79,21 @@ impl Boundary {
                     span: start..start + value.len(),
                 });
                 if prefix {
-                    return model.ok_or(ModelError::Missing);
+                    return Ok((model.ok_or(ModelError::Missing)?, audio));
                 }
             }
             if name.eq_ignore_ascii_case("file") {
-                if name != "file" || file_seen || !filename || value.is_empty() {
+                if name != "file" || audio.is_some() || !filename || value.is_empty() {
                     return Err(ModelError::Invalid);
                 }
-                file_seen = true;
+                audio = Some(value);
             }
             tail = &tail[marker + self.0.len()..];
             if matches!(tail, b"--" | b"--\r\n") {
-                if !file_seen {
+                if audio.is_none() {
                     return Err(ModelError::Invalid);
                 }
-                return model.ok_or(ModelError::Missing);
+                return Ok((model.ok_or(ModelError::Missing)?, audio));
             }
             tail = tail.strip_prefix(b"\r\n").ok_or(ModelError::Invalid)?;
         }
@@ -158,7 +162,7 @@ mod tests {
             b"--test\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nlow\r\n--test\r\n";
         assert_eq!(boundary.read_model_prefix(prefix).as_deref(), Some("low"));
         assert_eq!(
-            boundary.read_model(prefix).unwrap_err(),
+            boundary.read_upload(prefix).unwrap_err(),
             ModelError::Invalid
         );
         let incomplete = &prefix[..prefix.len() - b"\r\n--test\r\n".len()];

@@ -44,7 +44,6 @@ pub struct Failure {
     pub code: &'static str,
     pub message: &'static str,
     pub reached: &'static str,
-    pub attempted: bool,
     pub retry_after: Option<u64>,
 }
 
@@ -55,7 +54,6 @@ impl Failure {
             code: "unsupported_content",
             message,
             reached: "false",
-            attempted: false,
             retry_after: None,
         }
     }
@@ -66,7 +64,6 @@ impl Failure {
             code: "upstream_timeout",
             message: "The upstream response timed out.",
             reached,
-            attempted: true,
             retry_after: None,
         }
     }
@@ -77,7 +74,6 @@ impl Failure {
             code: "upstream_protocol_error",
             message: "The upstream returned an unusable response.",
             reached,
-            attempted: true,
             retry_after: None,
         }
     }
@@ -89,7 +85,6 @@ impl Failure {
                 code: "upstream_unreachable",
                 message: "The upstream could not be reached.",
                 reached: "false",
-                attempted: true,
                 retry_after: None,
             }
         } else if error.is_timeout() {
@@ -107,7 +102,6 @@ impl From<RateLimited> for Failure {
             code: error.code,
             message: error.message,
             reached: "false",
-            attempted: false,
             retry_after: Some(error.retry_after()),
         }
     }
@@ -171,6 +165,7 @@ pub async fn forward(
     surface: Surface,
     body: OutboundBody,
     admission: &mut Dispatch<'_>,
+    attempts: &mut u8,
 ) -> Result<Response, Failure> {
     let Target {
         client,
@@ -213,6 +208,7 @@ pub async fn forward(
     }
 
     admission.admit().await?;
+    *attempts += 1;
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let mut upstream_response = timeout_at(
         deadline,
@@ -232,7 +228,6 @@ pub async fn forward(
             code: "upstream_redirect",
             message: "The upstream returned a redirect.",
             reached: "true",
-            attempted: true,
             retry_after: None,
         });
     }
