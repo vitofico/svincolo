@@ -24,6 +24,9 @@ the same API surface. [Configure model tiers and discovery](docs/configuration.m
   are checked against the caller's original schema.
 - **Bounded transport.** Configure caller and upstream limits, opt-in queues,
   and graceful drain. Reload routes and credential files as one snapshot.
+- **Per-app cost reporting.** Attribute usage to each caller and upstream model,
+  track estimated provider charges, and export a monthly breakdown from the
+  [operator dashboard](#operator-cost-dashboard).
 
 ## Try it locally
 
@@ -86,6 +89,33 @@ Clients that record consent for a destination can send the catalog entry's
 `route_revision` as `x-svincolo-expect-route-revision`. A stale revision
 returns HTTP 409 before a provider is contacted.
 
+## Operator cost dashboard
+
+See which apps drive spend and which models they actually use, even when an
+app requests an alias such as `low`. The dashboard ranks callers by estimated
+monthly spend. Expand an app to see its provider, upstream model, API, usage,
+and cost. The coverage figures show attempts with missing usage or prices.
+**Export TSV** downloads the same monthly breakdown as the CLI.
+
+![Sample dashboard showing estimated monthly spend, cost by API, and apps ranked by spend.](docs/assets/cost-dashboard.jpg)
+
+Estimates use dated provider rates for managed Chat Completions, native
+Anthropic Messages and OpenAI Responses, embeddings, and audio transcriptions.
+Transcription charges can use audio duration or tokens, depending on the
+model. Raw Chat Completions are outside reporting coverage.
+
+To generate a standalone dashboard from router logs and your price table:
+
+```sh
+python3 scripts/cost-report.py --html --month 2026-11 --prices prices.json router.jsonl > cost-report.html
+```
+
+Open `cost-report.html` in a browser. For a live view, the optional Kubernetes
+collector updates the current UTC month every 30 seconds. The Theficos
+deployment is available on its LAN at [svincolo.theficos.local](http://svincolo.theficos.local/)
+on devices with that hostname mapping. See the [operator guide](docs/cost-report.md)
+for the price table format, usage coverage, and collector setup.
+
 ## Operate and contribute
 
 The listener serves HTTP and can connect to HTTPS upstreams using HTTP/1.1
@@ -96,10 +126,6 @@ declaration. Use network policy to enforce an egress boundary.
 See the [configuration and operations guide](docs/configuration.md) for
 provider examples, managed output, limits, key rotation, and TLS. The
 [Kubernetes canary guide](deploy/k8s/README.md) shows an isolated deployment.
-
-The [operator cost report](docs/cost-report.md) estimates monthly token spend by
-app and model for managed chat, native Messages and Responses, embeddings, and audio transcriptions. Its
-dashboard shows API usage, each app’s share of spend, and pricing coverage.
 
 Run the mock-provider suite with `cargo test --locked` to check routing,
 caller-scoped discovery, native Messages forwarding, and transport behavior.
