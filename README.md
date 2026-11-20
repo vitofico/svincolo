@@ -28,6 +28,30 @@ the same API surface. [Configure model tiers and discovery](docs/configuration.m
   track estimated provider charges, and export a monthly breakdown from the
   [operator dashboard](#operator-cost-dashboard).
 
+## Releases
+
+After the checks on `main` pass, CI publishes a multi-architecture Docker image
+and the same static Linux binaries tested inside it. The image and GitHub
+Release share a UTC CalVer tag, `YYYY.MM.MICRO`, starting at `0` each month.
+Use a release tag to pin a version, or pull the current release with:
+
+```sh
+docker pull ghcr.io/vitofico/svincolo:stable
+```
+
+For a standalone installation, download `svincolo-linux-amd64` (x86-64) or
+`svincolo-linux-arm64` (ARM64) from [GitHub Releases](https://github.com/vitofico/svincolo/releases).
+With the binary, `SHA256SUMS`, and `SHA256SUMS.sigstore.json` in the same
+directory, verify and install it (shown for amd64):
+
+```sh
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity https://github.com/vitofico/svincolo/.github/workflows/verify.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+install -Dm755 svincolo-linux-amd64 ~/.local/bin/svincolo
+```
+
 ## Try it locally
 
 With Rust installed through rustup and Ollama running locally, save the
