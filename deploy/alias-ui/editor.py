@@ -210,7 +210,7 @@ def page(text, revision, notice=""):
                      f'<form method="post">{fields("update", name)}{select("latest/" + followers[name] if name in followers else r["upstream_model"])}'
                      f'<button>Save destination</button></form>{remove}</section>')
     return rf"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="icon" href="favicon.ico"><title>Aliases and spending caps · Svincolo</title><style>
+<link rel="icon" href="favicon.ico?v=2"><title>Aliases and spending caps · Svincolo</title><style>
 *{{box-sizing:border-box}}body{{background:#f5f3ed;color:#202720;font:16px/1.5 Inter,system-ui,sans-serif;margin:0}}main{{max-width:54rem;margin:auto;padding:2rem 1rem 4rem}}h1{{font-size:2.6rem;letter-spacing:-.05em;margin:.5rem 0}}h2{{font-size:1.15rem;margin:0}}section{{padding:1.25rem;background:#fff;border:1px solid #cdcfc4;border-radius:.6rem;margin-top:1rem}}p{{margin:.35rem 0 .8rem}}form{{display:flex;gap:.5rem;flex-wrap:wrap}}select,input,button{{font:inherit;padding:.55rem;border-radius:.35rem;border:1px solid #9ca79b;max-width:100%}}button{{background:#214b37;color:white;cursor:pointer}}label{{display:grid;gap:.2rem}}form{{align-items:end}}h3{{margin:.2rem 0}}#budgets{{margin-top:2rem}}summary{{cursor:pointer}}details{{margin-top:.65rem}}a{{color:#214b37}}[role=status]{{background:#e4ecdf;padding:.7rem}}
 </style><main><a href="{escape(os.environ.get('DASHBOARD_URL', '/'), quote=True)}">Svincolo dashboard</a><h1>Model aliases</h1><a href="#budgets">Spending caps</a>
 <p>New aliases appear in Spunto. Saving a shared alias changes its destination for every app listed.</p>
