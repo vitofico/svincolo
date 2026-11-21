@@ -188,12 +188,13 @@ def decimal_text(value):
         return format(Decimal(value.numerator) / Decimal(value.denominator), "f")
 
 
-def summarize(paths, month, prices):
+def summarize(paths, month, prices, date_range=None):
     groups = defaultdict(Totals)
     seen = {}
     malformed_lines = duplicates = 0
     for path in paths:
-        source = nullcontext(sys.stdin) if path == "-" else open(path, encoding="utf-8")
+        source = (nullcontext(sys.stdin) if path == "-" else open(path, encoding="utf-8")
+                  if isinstance(path, (str, Path)) else nullcontext(path))
         with source as stream:
             for line_number, line in enumerate(stream, 1):
                 if not line.strip():
@@ -208,7 +209,9 @@ def summarize(paths, month, prices):
                 try:
                     timestamp = count(event, "timestamp_s")
                     day = datetime.fromtimestamp(timestamp, timezone.utc).date()
-                    if (day.year, day.month) != month:
+                    if month is not None and (day.year, day.month) != month:
+                        continue
+                    if date_range and not date_range[0] <= day <= date_range[1]:
                         continue
                     request_id = identifier(event, "request_id")
                     group = tuple(identifier(event, name) for name in
@@ -369,7 +372,7 @@ APP_COLORS = [
 ]
 
 
-def write_html(month, groups, malformed):
+def write_html(month, groups, malformed, *, period_label=None):
     total = Totals()
     apps = defaultdict(list)
     api_totals = defaultdict(Totals)
@@ -380,7 +383,7 @@ def write_html(month, groups, malformed):
         api_totals[surface].add(row)
         total.add(row)
 
-    period = date.fromisoformat(month + "-01").strftime("%B %Y")
+    period = period_label or date.fromisoformat(month + "-01").strftime("%B %Y")
     css = Path(__file__).with_name("cost-dashboard.css").read_text(encoding="utf-8")
     export = io.StringIO()
     write_tsv(groups, export)
@@ -408,7 +411,7 @@ def write_html(month, groups, malformed):
     coverage_text = ("Complete" if completeness else "Partial") if total.attempts else "No activity"
     print(f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Svincolo · Usage &amp; spend · {month}</title><style>{css}</style></head>
+<link rel="icon" href="favicon.ico"><title>Svincolo · Usage &amp; spend · {month}</title><style>{css}</style></head>
 <body><div class="top"><div class="nav-inner">
 <a class="brand" href="#overview"><i class="mark" aria-hidden="true"></i>Svincolo</a>
 <nav aria-label="Report sections"><a href="#overview">Overview</a><a href="#apps">Apps</a><a href="#apis">APIs</a></nav>
@@ -416,7 +419,7 @@ def write_html(month, groups, malformed):
 </div></div>
 <main><header id="overview" class="title-row"><h1>Usage &amp; spend</h1>
 <div class="period-stamp"><time datetime="{month}">{period}</time><small>UTC</small></div></header>
-<section class="hero" aria-label="Monthly spend and share by API">
+<section class="hero" aria-label="Spend and share by API">
 <div class="hero-metric"><div class="label">Estimated spend · USD</div><div class="amount">{usd(total)}</div>
 <p class="activity">{counted(total.requests, "request")} · {counted(total.attempts, "attempt")} · {counted(len(apps), "app")}</p></div>
 <div class="ring" style="background:{gradient}" aria-hidden="true"><div class="ring-core"><strong>{len(api_totals)}</strong>active APIs</div></div>
@@ -430,7 +433,8 @@ def write_html(month, groups, malformed):
 <div class="panels"><section id="apps" class="panel" aria-labelledby="apps-title"><div class="panel-head"><h2 id="apps-title">Applications</h2>
 <span class="secondary">{counted(len(apps), "app")}</span></div>""")
     if not apps:
-        print('<p class="empty">No API usage records for this month.</p>')
+        unit = "period" if period_label else "month"
+        print(f'<p class="empty">No API usage records for this {unit}.</p>')
     else:
         print('<div class="headings app-grid" aria-hidden="true"><span>Application</span><span>Calls</span>'
               '<span>Share</span><span class="money">Cost · USD</span><span></span></div>')
@@ -472,29 +476,41 @@ Local provider fees exclude hosting. Tool and storage fees are separate.""")
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--month", required=True, help="UTC month in YYYY-MM format")
+    parser.add_argument("--month", help="UTC month in YYYY-MM format")
+    parser.add_argument("--dates", nargs=2, metavar=("START", "END"), help="inclusive UTC date range")
     parser.add_argument("--prices", required=True, help="dated JSON price table")
     parser.add_argument("--html", action="store_true", help="render a standalone HTML report")
     parser.add_argument("logs", metavar="LOG", nargs="*", help="JSONL files (default: stdin)")
     args = parser.parse_args()
 
     try:
-        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", args.month):
-            raise ValueError("--month must use YYYY-MM")
-        month = date.fromisoformat(f"{args.month}-01")
+        date_range = None
+        month_key = None
+        label = None
+        if args.dates and not args.month:
+            first, last = map(date.fromisoformat, args.dates)
+            if first > last:
+                raise ValueError("End date precedes start date")
+            date_range = (first, last)
+            period_id = f"{first}_{last}"
+            label = f"{first} to {last}"
+        elif args.month and not args.dates and re.fullmatch(r"[0-9]{4}-[0-9]{2}", args.month):
+            month = date.fromisoformat(f"{args.month}-01")
+            month_key = (month.year, month.month)
+            period_id = args.month
+        else:
+            raise ValueError("Select --month YYYY-MM or --dates START END")
         prices = read_prices(args.prices)
-        groups, malformed, duplicates = summarize(
-            args.logs or ["-"], (month.year, month.month), prices
-        )
+        groups, malformed, duplicates = summarize(args.logs or ["-"], month_key, prices, date_range)
     except (OSError, ValueError) as error:
         parser.exit(2, f"cost-report: {error}\n")
 
     if args.html:
-        write_html(args.month, groups, malformed)
+        write_html(period_id, groups, malformed, period_label=label)
     else:
         write_tsv(groups)
     if not groups:
-        print(f"cost-report: no API usage events for {args.month} in input", file=sys.stderr)
+        print(f"cost-report: no API usage events for {period_id} in input", file=sys.stderr)
     if malformed:
         print(f"cost-report: skipped {malformed} non-JSON log lines", file=sys.stderr)
     if duplicates:

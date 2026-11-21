@@ -2,6 +2,9 @@
 """Collect API usage from router pods and serve the monthly report locally."""
 
 import json
+import importlib.util
+from contextlib import closing
+from threading import BoundedSemaphore
 import os
 import sqlite3
 import ssl
@@ -11,12 +14,13 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import escape
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from urllib.error import HTTPError
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -211,27 +215,50 @@ def collect(db, api):
     return sorted(errors)
 
 
-def render(db, now):
-    month = now.strftime("%Y-%m")
-    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    following = (start + timedelta(days=32)).replace(day=1)
+def events_between(db, start, end):
+    return (row[0] for row in db.execute(
+        "SELECT event FROM usage WHERE timestamp_s >= ? AND timestamp_s < ? ORDER BY timestamp_s",
+        (int(start.timestamp()), int(end.timestamp()))))
+
+
+def render_to(db, start, end, period_args, output):
     with tempfile.TemporaryFile(dir=REPORT.parent, mode="w+", encoding="utf-8") as events:
-        for (line,) in db.execute(
-            "SELECT event FROM usage WHERE timestamp_s >= ? AND timestamp_s < ? ORDER BY timestamp_s",
-            (int(start.timestamp()), int(following.timestamp())),
-        ):
+        for line in events_between(db, start, end):
             events.write(line + "\n")
         events.seek(0)
-        with tempfile.NamedTemporaryFile(dir=REPORT.parent, delete=False) as output:
-            temporary = Path(output.name)
-            try:
-                subprocess.run(
-                    [sys.executable, "-B", RENDERER, "--html", "--month", month, "--prices", PRICE_TABLE],
-                    stdin=events, stdout=output, stderr=subprocess.DEVNULL, check=True, timeout=60,
-                )
-                os.replace(temporary, REPORT)
-            finally:
-                temporary.unlink(missing_ok=True)
+        subprocess.run([sys.executable, "-B", RENDERER, "--html", *period_args, "--prices", PRICE_TABLE],
+                       stdin=events, stdout=output, stderr=subprocess.DEVNULL, check=True, timeout=60)
+
+
+def render(db, now):
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    following = (start + timedelta(days=32)).replace(day=1)
+    with tempfile.NamedTemporaryFile(dir=REPORT.parent, delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            render_to(db, start, following, ["--month", now.strftime("%Y-%m")], output)
+            os.replace(temporary, REPORT)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def publish_usage(db, now, pricing):
+    import spend
+    rates = pricing.read_prices(PRICE_TABLE)
+    periods = {}
+    for period, (start, end) in spend.windows(now).items():
+        groups, _, _ = pricing.summarize([events_between(db, start, end)], None, rates)
+        totals = {"provider": {}, "app": {}}
+        for (caller, provider, _, _surface), row in groups.items():
+            for scope, name in [("app", caller), ("provider", provider)]:
+                totals[scope][name] = totals[scope].get(name, 0) + row.known_cost_usd
+        periods[period] = {scope: {name: int(value * spend.UNIT) for name, value in amounts.items()}
+                           for scope, amounts in totals.items()}
+        periods[period].update(start=int(start.timestamp()), end=int(end.timestamp()))
+    spend.atomic("usage.json", dict(recorded_at=int(now.timestamp()), periods=periods))
+
+
+RANGE_SLOTS = BoundedSemaphore(2)
 
 
 @dataclass(frozen=True)
@@ -252,7 +279,18 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
-        if self.path not in ("/", "/index.html"):
+        url = urlsplit(self.path)
+        if url.path == "/favicon.ico":
+            icon = RENDERER.with_name("favicon.ico").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/x-icon")
+            self.send_header("Content-Length", str(len(icon)))
+            self.end_headers()
+            if self.command == "GET":
+                self.wfile.write(icon)
+            return
+        params = parse_qs(url.query, keep_blank_values=True)
+        if url.path not in ("/", "/index.html"):
             self.send_error(404)
             return
         refresh = self.server.refresh
@@ -264,16 +302,43 @@ class Handler(BaseHTTPRequestHandler):
                 page = REPORT.read_text(encoding="utf-8")
             except OSError:
                 pass
+        first = now.replace(day=1).date()
+        last = now.date()
+        if params:
+            try:
+                if set(params) != {"start", "end"} or any(len(v) != 1 for v in params.values()):
+                    raise ValueError
+                first, last = (datetime.strptime(params[k][0], "%Y-%m-%d").date() for k in ("start", "end"))
+                if first > last:
+                    raise ValueError
+                start = datetime.combine(first, datetime.min.time(), UTC)
+                end = datetime.combine(last + timedelta(days=1), datetime.min.time(), UTC)
+            except (ValueError, OverflowError):
+                self.send_error(400, "Choose a valid start and end date")
+                return
+            if not RANGE_SLOTS.acquire(blocking=False):
+                self.send_error(503, "Report generation is busy")
+                return
+            try:
+                with closing(sqlite3.connect(f"file:{DATA}/usage.sqlite3?mode=ro", uri=True)) as reader, tempfile.TemporaryFile(dir=REPORT.parent) as output:
+                    render_to(reader, start, end, ["--dates", first.isoformat(), last.isoformat()], output)
+                    output.seek(0)
+                    page = output.read().decode()
+            except (OSError, sqlite3.Error, subprocess.SubprocessError):
+                self.send_error(503, "Report generation unavailable")
+                return
+            finally:
+                RANGE_SLOTS.release()
         if page is None:
             page = (
                 "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
-                "<title>API costs unavailable</title><main>"
+                "<link rel=icon href=favicon.ico><title>API costs unavailable</title><main>"
                 "<h1>API costs unavailable</h1>"
                 "<p>The collector has yet to produce a report.</p></main></html>"
             )
         else:
-            age = now - refresh.rendered
-            clock = refresh.rendered.strftime("%Y-%m-%d %H:%M:%S UTC")
+            age = now - refresh.rendered if refresh.rendered else timedelta.max
+            clock = refresh.rendered.strftime("%Y-%m-%d %H:%M:%S UTC") if refresh.rendered else "pending"
             if refresh.complete and age <= STALE_AFTER:
                 status = 200
                 message = f"Last refreshed {clock}."
@@ -284,13 +349,29 @@ class Handler(BaseHTTPRequestHandler):
                     f"({age_seconds:,} seconds ago)."
                 )
             page = page.replace("<main>", f'<main><p class="period">{message}</p>', 1)
+        selector = (f'<form class="report-dates" method="get"><label>From <input type="date" name="start" value="{first}" required></label> '
+                    f'<label>Through <input type="date" name="end" value="{last}" required></label> '
+                    '<button>Show period</button></form>')
+        page = page.replace("</header>", "</header>" + selector, 1)
+        if os.environ.get("SVINCOLO_SPEND_DIR"):
+            import spend
+            try:
+                alerts = list(spend.alerts(spend.read("limits.json"), spend.read("usage.json")))
+            except (ValueError, OSError, KeyError):
+                alerts = ["Current budget status unavailable."]
+            if alerts:
+                page = page.replace("<main>", "<main><aside>" + " ".join(escape(a) for a in alerts) + "</aside>", 1)
+        editor = os.environ.get("ALIAS_EDITOR_URL")
+        if editor:
+            link = f'<a href="{escape(editor, quote=True)}">Aliases &amp; caps</a>'
+            page = page.replace("</nav>", link + "</nav>", 1) if "</nav>" in page else page.replace("<main>", "<main>" + link, 1)
         body = page.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+        self.send_header("Content-Security-Policy", "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'")
         self.end_headers()
         if self.command == "GET":
             self.wfile.write(body)
@@ -314,16 +395,26 @@ def main():
         os.environ.get("ROUTER_CONTAINER", "svincolo"),
     )
     db = connect(DATA / "usage.sqlite3")
-    dashboard = Dashboard(("127.0.0.1", 8081), Handler)
+    dashboard = Dashboard((os.environ.get("DASHBOARD_BIND_ADDRESS", "127.0.0.1"), 8081), Handler)
     if REPORT.is_file():
         dashboard.refresh = Refresh(datetime.fromtimestamp(REPORT.stat().st_mtime, UTC))
     Thread(target=dashboard.serve_forever, daemon=True).start()
+    pricing = None
+    if os.environ.get("SVINCOLO_SPEND_DIR"):
+        import spend
+        spend.initialize()
+        spec = importlib.util.spec_from_file_location("svincolo_pricing", RENDERER)
+        pricing = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = pricing
+        spec.loader.exec_module(pricing)
     last_log = None
     while True:
         begin = time.monotonic()
         try:
             errors = collect(db, api)
             now = datetime.now(UTC)
+            if pricing and not errors:
+                publish_usage(db, now, pricing)
             render(db, now)
             dashboard.refresh = Refresh(datetime.now(UTC), not errors)
             state = "incomplete (" + ", ".join(errors) + ")" if errors else "ready"

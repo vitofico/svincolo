@@ -8,6 +8,7 @@ mod native_usage;
 mod queue;
 mod rate;
 mod server;
+mod spend;
 mod state;
 mod upstream;
 mod usage_log;
