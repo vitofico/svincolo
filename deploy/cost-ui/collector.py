@@ -332,7 +332,7 @@ class Handler(BaseHTTPRequestHandler):
         if page is None:
             page = (
                 "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">"
-                "<link rel=icon href=favicon.ico><title>API costs unavailable</title><main>"
+                "<link rel=icon href='favicon.ico?v=2'><title>API costs unavailable</title><main>"
                 "<h1>API costs unavailable</h1>"
                 "<p>The collector has yet to produce a report.</p></main></html>"
             )

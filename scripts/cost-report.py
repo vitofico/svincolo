@@ -411,7 +411,7 @@ def write_html(month, groups, malformed, *, period_label=None):
     coverage_text = ("Complete" if completeness else "Partial") if total.attempts else "No activity"
     print(f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="favicon.ico"><title>Svincolo · Usage &amp; spend · {month}</title><style>{css}</style></head>
+<link rel="icon" href="favicon.ico?v=2"><title>Svincolo · Usage &amp; spend · {month}</title><style>{css}</style></head>
 <body><div class="top"><div class="nav-inner">
 <a class="brand" href="#overview"><i class="mark" aria-hidden="true"></i>Svincolo</a>
 <nav aria-label="Report sections"><a href="#overview">Overview</a><a href="#apps">Apps</a><a href="#apis">APIs</a></nav>
