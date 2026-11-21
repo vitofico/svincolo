@@ -148,6 +148,11 @@ access controls as your usage logs.
 
 ## Live operator view
 
-The optional [Kubernetes collector](../deploy/cost-ui/collector.py) renders the current UTC month every 30 seconds. It reads router pod logs, persists managed and native usage events by request ID in SQLite, and serves the dashboard on pod loopback port 8081. Expand a caller to see its provider, models, token counts, audio duration, and estimated costs. Refresh the browser for the latest snapshot.
+The optional [Kubernetes collector](../deploy/cost-ui/collector.py) renders the current UTC month every 30 seconds. It reads router pod logs, persists managed and native usage events by request ID in SQLite, and serves the dashboard on port 8081. The listener defaults to pod loopback. Set `DASHBOARD_BIND_ADDRESS` to the pod IP to serve it through a Service with restricted ingress. Expand a caller to see its provider, models, token counts, audio duration, and estimated costs. Refresh the browser for the latest snapshot.
 
-Run the collector with the report script at `/app/cost-report.py`, its stylesheet at `/app/cost-dashboard.css`, rates at `/config/prices.json`, and persistent storage at `/data`. Its service account needs pod list and pod log read permissions in the router namespace. Connect through an authorized Kubernetes port-forward. The page shows the last refresh time and returns HTTP 503 when collection is unavailable or stale.
+Run the collector with the report script at `/app/cost-report.py`, its stylesheet and favicon at `/app/cost-dashboard.css` and `/app/favicon.ico`, rates at `/config/prices.json`, and persistent storage at `/data`. Its service account needs pod list and pod log read permissions in the router namespace. Connect through an authorized Kubernetes port-forward. The page shows the last refresh time and returns HTTP 503 when collection is unavailable or stale.
+
+
+The dashboard date fields select an inclusive UTC range. The same range can be exported from the CLI using `--dates YYYY-MM-DD YYYY-MM-DD` in place of `--month`.
+
+To enable spending limits, install `deploy/cost-ui/spend.py` beside the collector and mount a persistent spending directory. Set `SVINCOLO_SPEND_DIR` on the collector, operator editor and router. Mount the directory read-only on the router. Each application and provider may have a soft dashboard warning and a hard threshold for a UTC day, week or month. The router checks recorded, priced spend before dispatch and returns HTTP 402 at the hard threshold. In-flight work can finish and usage collection can lag. Keep the operator editor behind authenticated HTTPS on a restricted network.

@@ -154,6 +154,8 @@ pub struct OutboundBody {
 }
 
 pub struct Target<'a> {
+    pub spend_dir: Option<&'a std::path::Path>,
+    pub caller: &'a str,
     pub client: &'a Client,
     pub upstream: &'a Upstream,
     pub headers: &'a HeaderMap,
@@ -168,6 +170,8 @@ pub async fn forward(
     attempts: &mut u8,
 ) -> Result<Response, Failure> {
     let Target {
+        spend_dir,
+        caller,
         client,
         upstream,
         headers,
@@ -208,6 +212,9 @@ pub async fn forward(
     }
 
     admission.admit().await?;
+    if let Some(dir) = spend_dir {
+        crate::spend::check(dir, caller, &upstream.provider).await?;
+    }
     *attempts += 1;
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let mut upstream_response = timeout_at(

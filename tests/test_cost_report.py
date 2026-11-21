@@ -57,6 +57,16 @@ class CostReportTest(unittest.TestCase):
             "local": {"model": {"2026-11-01": dict.fromkeys(TOKEN_FIELDS, 0)}},
         }), encoding="utf-8")
 
+    def test_date_range_crosses_month_and_includes_both_dates(self):
+        report = subprocess.run(
+            [sys.executable, SCRIPT, "--dates", "2026-11-30", "2026-12-01", "--prices", self.prices],
+            input=jsonl(usage("early"), usage("last-november", DECEMBER_1 - 1),
+                        usage("first-december", DECEMBER_1), usage("late", DECEMBER_1 + 86400)),
+            text=True, capture_output=True, check=True,
+        )
+        rows = list(csv.DictReader(io.StringIO(report.stdout), delimiter="\t"))
+        self.assertEqual(next(row["requests"] for row in rows if row["scope"] == "total"), "2")
+
     def run_report(self, stdin="", *logs, html=False):
         options = ["--html"] if html else []
         return subprocess.run(

@@ -44,6 +44,7 @@ use crate::{
 };
 
 struct App {
+    spend_dir: Option<PathBuf>,
     current: watch::Sender<Arc<Snapshot>>,
     client: reqwest::Client,
     budget: Arc<Capacity>,
@@ -73,6 +74,7 @@ pub async fn serve(config: Config, path: PathBuf, inputs: FileInputs) -> Result<
         cloud.cancel();
     }
     let app = Arc::new(App {
+        spend_dir: std::env::var_os("SVINCOLO_SPEND_DIR").map(PathBuf::from),
         client,
         budget: Arc::new(Capacity::default()),
         active: Arc::new(Capacity::default()),
@@ -493,6 +495,8 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
     let started = Instant::now();
     let mut working = None;
     let target = upstream::Target {
+        spend_dir: app.spend_dir.as_deref(),
+        caller: caller.map_or("anonymous", |c| c.name.as_str()),
         client: &app.client,
         upstream: &route.upstream,
         headers,
@@ -1267,6 +1271,7 @@ impl Metadata<'_> {
     fn error_with_details(&self, fault: Fault, details: Option<serde_json::Value>) -> Response {
         let kind = match fault.status {
             401 => "authentication_error",
+            402 => "billing_error",
             403 => "permission_error",
             404 => "not_found_error",
             408 | 504 => "timeout_error",
@@ -1295,7 +1300,7 @@ impl Metadata<'_> {
             HeaderValue::from_static("application/json"),
         );
         headers.insert("x-should-retry", HeaderValue::from_static("false"));
-        if matches!(fault.status, 429 | 503) {
+        if matches!(fault.status, 402 | 429 | 503) {
             headers.insert(header::RETRY_AFTER, fault.retry_after.unwrap_or(1).into());
         }
         self.write_headers(headers, "router", fault.reached);

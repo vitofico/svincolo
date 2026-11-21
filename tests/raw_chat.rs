@@ -170,7 +170,13 @@ routes = ["chat:test", "chat:cloud"]
         )
         .unwrap();
         drop(reservation);
+        fs::write(
+            directory.path().join("limits.json"),
+            r#"{"app":{},"provider":{}}"#,
+        )
+        .unwrap();
         let router = Command::new(env!("CARGO_BIN_EXE_svincolo"))
+            .env("SVINCOLO_SPEND_DIR", directory.path())
             .args(["serve", "--config"])
             .arg(config)
             .stdout(Stdio::null())
@@ -456,4 +462,33 @@ async fn refuses_redirects_and_redacts_provider_credentials() {
     );
     fixture.seen().await;
     fixture.no_more_calls();
+}
+
+#[tokio::test]
+async fn provider_cap_refuses_before_forward_and_clearing_it_restores_access() {
+    let mut fx = Fixture::start(Reply::Bytes).await;
+    let dir = fx._directory.path();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ledger = serde_json::json!({"recorded_at":now, "periods":{
+        "month":{"start":now-30,"end":now+100,"app":{},"provider":{"mock":123}}
+    }});
+    fs::write(dir.join("usage.json"), ledger.to_string()).unwrap();
+    fs::write(
+        dir.join("limits.json"),
+        r#"{"app":{},"provider":{"mock":{"period":"month","hard":123}}}"#,
+    )
+    .unwrap();
+    let send = || fx.chat(CHAT).bearer_auth(CALLER_KEY).body(BODY).send();
+    let response = send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(response.headers()["x-svincolo-provider-reached"], "false");
+    assert!(response.text().await.unwrap().contains("spend_cap_reached"));
+    fs::write(dir.join("limits.json"), r#"{"app":{},"provider":{}}"#).unwrap();
+    let response = send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    fx.seen().await;
+    fx.no_more_calls();
 }
