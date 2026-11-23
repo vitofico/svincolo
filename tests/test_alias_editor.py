@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import re
 import tomllib
 import unittest
 
@@ -11,6 +12,8 @@ editor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(editor)
 
 CONFIG = '''
+# svincolo-latest sol sol
+# svincolo-latest haiku haiku
 [[caller]]
 name = "spunto"
 routes = ["high", "sol", "haiku"]
@@ -50,13 +53,26 @@ class AliasEditorTest(unittest.TestCase):
         removed = editor.edit(changed, "delete", "notes", "")
         self.assertEqual(tomllib.loads(removed), tomllib.loads(CONFIG))
 
+    def test_shared_tiers_only_accept_and_display_families(self):
+        for tier in ("high", "medium", "low"):
+            with self.subTest(tier=tier):
+                config = CONFIG.replace('"high"', f'"{tier}"')
+                with self.assertRaisesRegex(editor.Invalid, "family"):
+                    editor.edit(config, "update", tier, "sol")
+                updated = editor.edit(config, "update", tier, "latest/haiku")
+                html = editor.page(updated, "1")
+                card = html.split(f"<h2>{tier}</h2>")[1].split("</section>")[0]
+                self.assertEqual(re.findall(r'<option value="([^"]*)"', card), ["latest/haiku", "latest/sol"])
+                self.assertIn('value="latest/haiku" selected>Haiku</option>', card)
+                self.assertIn("# svincolo-follow haiku", updated)
+
     def test_protects_route_and_preserves_tier_settings(self):
         for action, name, model in [("create", "high", "sol"), ("create", "claude-new", "sol"),
                                     ("update", "sol", "haiku"), ("delete", "high", ""),
                                     ("create", "notes", "high")]:
             with self.subTest(action=action, name=name), self.assertRaises(editor.Invalid):
                 editor.edit(CONFIG, action, name, model)
-        config = tomllib.loads(editor.edit(CONFIG, "update", "high", "haiku"))
+        config = tomllib.loads(editor.edit(CONFIG, "update", "high", "latest/haiku"))
         self.assertEqual(config["route"][-1]["validation_retries"], 1)
         self.assertEqual(config["route"][-1]["default_max_tokens"], 8192)
         self.assertEqual(config["caller"], tomllib.loads(CONFIG)["caller"])

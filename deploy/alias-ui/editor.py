@@ -22,6 +22,7 @@ ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 SECRET = "https://kubernetes.default.svc/api/v1/namespaces/svincolo/secrets/svincolo-config"
 DIGEST = Path("/run/operator/digest")
 NAME = re.compile(r"[a-z][a-z0-9_-]{0,62}")
+TIERS = {"low", "medium", "high"}
 MANAGED = {"structured_modes", "validation_retries", "default_max_tokens"}
 
 
@@ -69,6 +70,8 @@ def edit(text, action, name, model):
     spunto, targets, aliases = route_index(config)
     existing = aliases.get(name)
     family = None
+    if name in TIERS and action in ("create", "update") and not model.startswith("latest/"):
+        raise Invalid("Choose a model family for this alias.")
     if model.startswith("latest/"):
         family = model.removeprefix("latest/")
         latest = dict(re.findall(r"^# svincolo-latest (sol|terra|haiku) ([a-z0-9.-]+)$", text, re.M))
@@ -83,7 +86,7 @@ def edit(text, action, name, model):
     elif action not in ("update", "delete") or not existing:
         raise Invalid("Select an existing alias.")
     if action == "delete":
-        if name in ("low", "medium", "high") or callers_for(config, name) != ["spunto"]:
+        if name in TIERS or callers_for(config, name) != ["spunto"]:
             raise Invalid("Only custom aliases used exclusively by Spunto can be removed here.")
         config["route"].remove(existing)
         spunto["routes"].remove(name)
@@ -186,28 +189,33 @@ def page(text, revision, notice=""):
         if following and block.startswith("[[route]]"):
             followers[tomllib.loads(block)["route"][0]["name"]] = following[1]
     latest = dict(re.findall(r"^# svincolo-latest (sol|terra|haiku) ([a-z0-9.-]+)$", text, re.M))
-    def select(current=None):
-        options = []
+    def select(current=None, family_only=False):
+        label = "Model family" if family_only else "Destination model"
+        choices = {}
         for family, dest in sorted(latest.items()):
             if dest in targets:
-                value = "latest/" + family
-                selected = " selected" if current == value else ""
-                options.append(f'<option value="{value}"{selected}>Latest {family.title()} · {escape(dest)}</option>')
-        for model, r in sorted(targets.items()):
-            selected = " selected" if model == current else ""
-            options.append(f'<option value="{escape(model, quote=True)}"{selected}>{escape(model)} · {escape(", ".join(r["surfaces"]))}</option>')
-        if current not in targets and not (current or "").startswith("latest/"):
-            options.insert(0, '<option value="" selected disabled>Choose a model</option>')
-        return '<select aria-label="Destination model" name="model" required>' + "".join(options) + "</select>"
+                choices["latest/" + family] = family.title() if family_only else f"Latest {family.title()} · {dest}"
+        if not family_only:
+            for model, route in sorted(targets.items()):
+                choices[model] = f"{model} · {', '.join(route['surfaces'])}"
+        options = []
+        if current not in choices:
+            prompt = "Choose a family" if family_only else "Choose a model"
+            options.append(f'<option value="" selected disabled>{prompt}</option>')
+        for value, caption in choices.items():
+            selected = " selected" if value == current else ""
+            options.append(f'<option value="{escape(value, quote=True)}"{selected}>{escape(caption)}</option>')
+        return f'<select aria-label="{label}" name="model" required>' + "".join(options) + "</select>"
     cards = []
     for name, r in aliases.items():
         callers = callers_for(config, name)
         remove = ""
-        if name not in ("low", "medium", "high") and callers == ["spunto"]:
+        if name not in TIERS and callers == ["spunto"]:
             remove = (f'<details><summary>Remove alias</summary><form method="post">{fields("delete", name)}'
                       f'<button>Confirm removal of {escape(name)}</button></form></details>')
+        current = "latest/" + followers[name] if name in followers else r["upstream_model"]
         cards.append(f'<section><h2>{escape(name)}</h2><p>Used by {escape(", ".join(callers))}</p>'
-                     f'<form method="post">{fields("update", name)}{select("latest/" + followers[name] if name in followers else r["upstream_model"])}'
+                     f'<form method="post">{fields("update", name)}{select(current, family_only=name in TIERS)}'
                      f'<button>Save destination</button></form>{remove}</section>')
     return rf"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="icon" href="favicon.ico?v=2"><title>Aliases and spending caps · Svincolo</title><style>
