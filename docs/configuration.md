@@ -10,7 +10,7 @@ Clients can present it as a bearer token or an `x-api-key`. Configure provider
 credentials separately using `key_file` or `key_env` on the upstream. Relative
 key-file paths resolve from the config directory.
 
-For installations using the Kubernetes operator editor, open **Provider API keys** to add or rotate credentials for the configured OpenAI and Anthropic upstreams. The editor verifies the candidate with the provider’s model-list endpoint before saving. If verification fails, it keeps the existing key. Reopen the editor to check the current provider status. Local Ollama can serve models without a provider key.
+For installations using the Kubernetes operator editor, open **Provider API keys** to add or rotate credentials for the configured OpenAI and Anthropic upstreams. The editor stages the candidate in the router Secret. The catalog worker verifies it with the provider’s model-list endpoint before promotion. If verification fails, it keeps the existing key. Reopen the editor to check the current provider status. Local Ollama can serve models without a provider key.
 
 ## Native Anthropic Messages
 

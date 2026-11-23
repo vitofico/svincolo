@@ -4,7 +4,6 @@ import base64
 import copy
 import hashlib
 import hmac
-import http.client
 import json
 import os
 import re
@@ -148,9 +147,7 @@ def kubernetes(patch=None, *, availability=False):
                 states = {u["name"]: "Key required" for u in config.get("upstream", [])
                           if u["name"] in PROVIDERS}
                 for name, file in provider_key_files(config).items():
-                    value = base64.b64decode(data.get(file, "")).decode("ascii", errors="replace").strip()
-                    if value:
-                        states[name] = provider_status(name, value)
+                    states[name] = provider_state(data, name, file)
                 return (*snapshot, states)
             return snapshot
 
@@ -172,24 +169,15 @@ def provider_key_files(config):
     return key_files
 
 
-def provider_status(provider, value):
-    if not re.fullmatch(r"[!-~]{1,1024}", value):
-        return "Invalid key"
-    headers = ({"Authorization": "Bearer " + value} if provider == "openai" else
-               {"x-api-key": value, "anthropic-version": "2023-06-01"})
-    request = Request(PROVIDERS[provider][1] + "/models", headers=headers)
-    try:
-        with build_opener(NoRedirect()).open(request, timeout=5) as response:
-            payload = response.read(2_097_153)
-            if len(payload) <= 2_097_152 and isinstance(json.loads(payload).get("data"), list):
-                return "Active"
-    except HTTPError as exc:
-        exc.close()
-        if exc.code in (401, 403):
-            return "Key rejected"
-    except (OSError, ValueError, AttributeError, http.client.HTTPException):
-        pass
-    return "Verification unavailable"
+def provider_state(data, provider, filename):
+    active = base64.b64decode(data.get(filename, "")).strip()
+    proof = base64.b64decode(data.get(provider + ".verified", ""))
+    status = "Active" if active and hmac.compare_digest(hashlib.sha256(active).hexdigest().encode(), proof) else "Key required"
+    if provider + ".pending" in data:
+        return status + " · verification pending"
+    if provider + ".rejected" in data:
+        return status + " · last submission rejected"
+    return status
 
 
 def save_provider_key(config, revision, provider, value):
@@ -198,13 +186,8 @@ def save_provider_key(config, revision, provider, value):
         raise Invalid("Choose a configured provider.")
     if not re.fullmatch(r"[!-~]{1,1024}", value):
         raise Invalid("Enter a single API key without spaces.")
-    status = provider_status(provider, value)
-    if status == "Verification unavailable":
-        raise OSError("Provider verification unavailable.")
-    if status != "Active":
-        raise Invalid("The provider rejected this key.")
     kubernetes([{"op": "test", "path": "/metadata/resourceVersion", "value": revision},
-                {"op": "add", "path": "/data/" + filename,
+                {"op": "add", "path": "/data/" + provider + ".pending",
                  "value": base64.b64encode(value.encode("ascii")).decode("ascii")}])
 
 
@@ -246,7 +229,7 @@ def budget_forms(config):
 def page(text, revision, notice="", states=None):
     config = tomllib.loads(text)
     states = states or {}
-    _, targets, aliases = route_index(config, {name for name, status in states.items() if status != "Active"})
+    _, targets, aliases = route_index(config, {name for name, status in states.items() if status.split(" · ")[0] != "Active"})
     def fields(action, name=""):
         return (f'<input type="hidden" name="action" value="{action}">'
                 f'<input type="hidden" name="revision" value="{escape(revision, quote=True)}">'
@@ -257,9 +240,9 @@ def page(text, revision, notice="", states=None):
         key_forms.append(f'<form method="post">{fields("provider_key", provider)}'
                          f'<label>{escape(label)} API key · {escape(states.get(provider, "Key required"))}<input type="password" name="api_key" '
                          'autocomplete="new-password" spellcheck="false" maxlength="1024" required></label>'
-                         '<button>Save key</button></form>')
+                         '<button>Submit key</button></form>')
     keys_section = ('<section id="provider-keys"><h2>Provider API keys</h2>'
-                    '<p>Saving a key replaces the credential used for new requests to that provider.</p>'
+                    '<p>The hourly catalog check verifies submitted keys before activating them. A working key stays active during verification.</p>'
                     + "".join(key_forms) + "</section>") if key_forms else ""
     followers = {}
     for block in re.split(r"(?=^\[\[)", text, flags=re.M):
@@ -391,7 +374,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(303, Location=PATH + "?saved#provider-keys")
                 return
             updated = edit(text, form["action"][0], form["name"][0], form.get("model", [""])[0],
-                           {name for name, status in states.items() if status != "Active"})
+                           {name for name, status in states.items() if status.split(" · ")[0] != "Active"})
             if updated != text:
                 kubernetes([{"op":"test", "path":"/metadata/resourceVersion", "value":rev},
                             {"op":"replace", "path":"/data/svincolo.toml",

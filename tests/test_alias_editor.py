@@ -4,8 +4,7 @@ from pathlib import Path
 import re
 import tomllib
 import unittest
-from unittest.mock import MagicMock, patch
-from urllib.error import HTTPError
+from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location(
@@ -64,44 +63,24 @@ base_url = "http://localhost:11434"
             editor.edit(config, "update", "high", "latest/sol", {"openai"})
         self.assertIn('value="latest/sol"', editor.page(config, "123", states={"openai": "Active"}))
 
-    def test_verify_before_updating_only_selected_secret_field(self):
+    def test_submission_only_stages_a_candidate(self):
         cfg = {"upstream": [{"name": "openai", "base_url": editor.PROVIDERS["openai"][1],
                              "key_file": "openai.key"}]}
-        value = "fictional-test-token"
-        with patch.object(editor, "kubernetes") as write, patch.object(editor, "provider_status") as status:
-            status.return_value = "Key rejected"
-            with self.assertRaises(editor.Invalid):
-                editor.save_provider_key(cfg, "v1", "openai", value)
-            write.assert_not_called()
-            status.return_value = "Verification unavailable"
-            with self.assertRaises(OSError):
-                editor.save_provider_key(cfg, "v1", "openai", value)
-            write.assert_not_called()
-            status.return_value = "Active"
-            editor.save_provider_key(cfg, "v1", "openai", value)
+        with patch.object(editor, "kubernetes") as write:
+            editor.save_provider_key(cfg, "v1", "openai", "synthetic")
             write.assert_called_once_with([
                 {"op": "test", "path": "/metadata/resourceVersion", "value": "v1"},
-                {"op": "add", "path": "/data/openai.key", "value": base64.b64encode(value.encode()).decode()},
+                {"op": "add", "path": "/data/openai.pending", "value": base64.b64encode(b"synthetic").decode()},
             ])
         cfg["caller"] = [{"key_file": "openai.key"}]
         self.assertEqual(editor.provider_key_files(cfg), {})
 
-    def test_provider_validation_uses_official_models_endpoint_and_classifies_errors(self):
-        for provider in editor.PROVIDERS:
-            with self.subTest(provider=provider), patch.object(editor, "build_opener") as factory:
-                opener = factory.return_value
-                response = MagicMock()
-                response.read.return_value = b'{"data": []}'
-                opener.open.return_value.__enter__.return_value = response
-                self.assertEqual(editor.provider_status(provider, "synthetic"), "Active")
-                request = opener.open.call_args.args[0]
-                self.assertEqual(request.full_url, editor.PROVIDERS[provider][1] + "/models")
-                header = "Authorization" if provider == "openai" else "X-api-key"
-                self.assertIn("synthetic", request.headers[header])
-                opener.open.side_effect = HTTPError(request.full_url, 401, "denied", {}, None)
-                self.assertEqual(editor.provider_status(provider, "synthetic"), "Key rejected")
-                opener.open.side_effect = TimeoutError()
-                self.assertEqual(editor.provider_status(provider, "synthetic"), "Verification unavailable")
+    def test_only_validated_active_key_is_selectable_during_rotation(self):
+        key = b"synthetic"
+        data = {"openai.key": base64.b64encode(key), "openai.pending": base64.b64encode(b"next")}
+        self.assertEqual(editor.provider_state(data, "openai", "openai.key"), "Key required · verification pending")
+        data["openai.verified"] = base64.b64encode(editor.hashlib.sha256(key).hexdigest().encode())
+        self.assertEqual(editor.provider_state(data, "openai", "openai.key"), "Active · verification pending")
 
     def test_create_retarget_and_delete(self):
         added = editor.edit(CONFIG, "create", "notes", "sol")
