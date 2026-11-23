@@ -1,8 +1,10 @@
+import base64
 import importlib.util
 from pathlib import Path
 import re
 import tomllib
 import unittest
+from unittest.mock import patch
 
 
 spec = importlib.util.spec_from_file_location(
@@ -42,6 +44,44 @@ surfaces = { chat = "managed", responses = "raw" }
 
 
 class AliasEditorTest(unittest.TestCase):
+    def test_key_forms_and_inactive_destinations(self):
+        config = CONFIG + """
+[[upstream]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+key_file = "openai.key"
+[[upstream]]
+name = "ollama"
+base_url = "http://localhost:11434"
+"""
+        html = editor.page(config, "123", states={"openai": "Key rejected"})
+        self.assertIn('type="password"', html)
+        self.assertIn('OpenAI API key · Key rejected', html)
+        self.assertNotIn("Ollama API key", html)
+        self.assertNotIn('value="latest/sol"', html)
+        with self.assertRaises(editor.Invalid):
+            editor.edit(config, "update", "high", "latest/sol", {"openai"})
+        self.assertIn('value="latest/sol"', editor.page(config, "123", states={"openai": "Active"}))
+
+    def test_submission_only_stages_a_candidate(self):
+        cfg = {"upstream": [{"name": "openai", "base_url": editor.PROVIDERS["openai"][1],
+                             "key_file": "openai.key"}]}
+        with patch.object(editor, "kubernetes") as write:
+            editor.save_provider_key(cfg, "v1", "openai", "synthetic")
+            write.assert_called_once_with([
+                {"op": "test", "path": "/metadata/resourceVersion", "value": "v1"},
+                {"op": "add", "path": "/data/openai.pending", "value": base64.b64encode(b"synthetic").decode()},
+            ])
+        cfg["caller"] = [{"key_file": "openai.key"}]
+        self.assertEqual(editor.provider_key_files(cfg), {})
+
+    def test_only_validated_active_key_is_selectable_during_rotation(self):
+        key = b"synthetic"
+        data = {"openai.key": base64.b64encode(key), "openai.pending": base64.b64encode(b"next")}
+        self.assertEqual(editor.provider_state(data, "openai", "openai.key"), "Key required · verification pending")
+        data["openai.verified"] = base64.b64encode(editor.hashlib.sha256(key).hexdigest().encode())
+        self.assertEqual(editor.provider_state(data, "openai", "openai.key"), "Active · verification pending")
+
     def test_create_retarget_and_delete(self):
         added = editor.edit(CONFIG, "create", "notes", "sol")
         config = tomllib.loads(added)

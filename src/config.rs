@@ -232,6 +232,8 @@ impl Default for ServerConfig {
 #[serde(deny_unknown_fields)]
 struct UpstreamConfig {
     name: String,
+    #[serde(default)]
+    disabled: bool,
     kind: UpstreamKind,
     provider: Option<String>,
     base_url: String,
@@ -477,12 +479,20 @@ impl Config {
         }
 
         let mut upstreams = HashMap::new();
-        for (index, upstream) in input.upstream.into_iter().enumerate() {
+        let mut disabled = HashSet::new();
+        for (index, mut upstream) in input.upstream.into_iter().enumerate() {
             let location = format!("upstream[{}]", index + 1);
             if !valid_name(&upstream.name) || upstreams.contains_key(&upstream.name) {
                 return Err(format!("{location}.name must be a unique identifier"));
             }
             let name = upstream.name.clone();
+            if upstream.disabled {
+                disabled.insert(name.clone());
+                // Disabled upstreams need no credential, including on first setup.
+                upstream.key_file = None;
+                upstream.key_env = None;
+                upstream.auth = Some(Auth::None);
+            }
             let allow_plain_http = upstream.allow_plain_http;
             let compiled = Arc::new(upstream.compile(directory, &location, inputs)?);
             upstreams.insert(name, (compiled, allow_plain_http));
@@ -603,6 +613,9 @@ impl Config {
             });
         }
 
+        // Check caller permissions against the declared routes before omitting
+        // disabled upstreams from the table shared by discovery and dispatch.
+        routes.retain(|_, route| !disabled.contains(&route.upstream.name));
         Ok(Self {
             listen: server.listen,
             local_only: server.local_only,
@@ -1007,6 +1020,29 @@ surfaces = { chat = "raw" }
             let text = format!("version = 1\n[server]\n{key} = {value}");
             assert!(invalid(&text, directory).contains(key));
         }
+    }
+
+    #[test]
+    fn disabled_provider_preserves_local_routes_without_its_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let paid = ROUTE
+            .split_once("[[upstream]]")
+            .unwrap()
+            .1
+            .replace("engine", "paid")
+            .replace("test:1", "paid-model");
+        let config =
+            format!("{ROUTE}\n[[upstream]]\ndisabled = true\nkey_file = 'missing.key'\n{paid}");
+        let current = Config::parse(&config, directory.path()).unwrap();
+        assert!(current.routes.contains_key("test:1"));
+        assert!(!current.routes.contains_key("paid-model"));
+        assert!(
+            Config::parse(
+                &config.replace("disabled = true", "disabled = false"),
+                directory.path()
+            )
+            .is_err()
+        );
     }
 
     #[test]
