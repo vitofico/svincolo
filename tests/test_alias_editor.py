@@ -1,8 +1,11 @@
+import base64
 import importlib.util
 from pathlib import Path
 import re
 import tomllib
 import unittest
+from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 
 spec = importlib.util.spec_from_file_location(
@@ -42,6 +45,64 @@ surfaces = { chat = "managed", responses = "raw" }
 
 
 class AliasEditorTest(unittest.TestCase):
+    def test_key_forms_and_inactive_destinations(self):
+        config = CONFIG + """
+[[upstream]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+key_file = "openai.key"
+[[upstream]]
+name = "ollama"
+base_url = "http://localhost:11434"
+"""
+        html = editor.page(config, "123", states={"openai": "Key rejected"})
+        self.assertIn('type="password"', html)
+        self.assertIn('OpenAI API key · Key rejected', html)
+        self.assertNotIn("Ollama API key", html)
+        self.assertNotIn('value="latest/sol"', html)
+        with self.assertRaises(editor.Invalid):
+            editor.edit(config, "update", "high", "latest/sol", {"openai"})
+        self.assertIn('value="latest/sol"', editor.page(config, "123", states={"openai": "Active"}))
+
+    def test_verify_before_updating_only_selected_secret_field(self):
+        cfg = {"upstream": [{"name": "openai", "base_url": editor.PROVIDERS["openai"][1],
+                             "key_file": "openai.key"}]}
+        value = "fictional-test-token"
+        with patch.object(editor, "kubernetes") as write, patch.object(editor, "provider_status") as status:
+            status.return_value = "Key rejected"
+            with self.assertRaises(editor.Invalid):
+                editor.save_provider_key(cfg, "v1", "openai", value)
+            write.assert_not_called()
+            status.return_value = "Verification unavailable"
+            with self.assertRaises(OSError):
+                editor.save_provider_key(cfg, "v1", "openai", value)
+            write.assert_not_called()
+            status.return_value = "Active"
+            editor.save_provider_key(cfg, "v1", "openai", value)
+            write.assert_called_once_with([
+                {"op": "test", "path": "/metadata/resourceVersion", "value": "v1"},
+                {"op": "add", "path": "/data/openai.key", "value": base64.b64encode(value.encode()).decode()},
+            ])
+        cfg["caller"] = [{"key_file": "openai.key"}]
+        self.assertEqual(editor.provider_key_files(cfg), {})
+
+    def test_provider_validation_uses_official_models_endpoint_and_classifies_errors(self):
+        for provider in editor.PROVIDERS:
+            with self.subTest(provider=provider), patch.object(editor, "build_opener") as factory:
+                opener = factory.return_value
+                response = MagicMock()
+                response.read.return_value = b'{"data": []}'
+                opener.open.return_value.__enter__.return_value = response
+                self.assertEqual(editor.provider_status(provider, "synthetic"), "Active")
+                request = opener.open.call_args.args[0]
+                self.assertEqual(request.full_url, editor.PROVIDERS[provider][1] + "/models")
+                header = "Authorization" if provider == "openai" else "X-api-key"
+                self.assertIn("synthetic", request.headers[header])
+                opener.open.side_effect = HTTPError(request.full_url, 401, "denied", {}, None)
+                self.assertEqual(editor.provider_status(provider, "synthetic"), "Key rejected")
+                opener.open.side_effect = TimeoutError()
+                self.assertEqual(editor.provider_status(provider, "synthetic"), "Verification unavailable")
+
     def test_create_retarget_and_delete(self):
         added = editor.edit(CONFIG, "create", "notes", "sol")
         config = tomllib.loads(added)

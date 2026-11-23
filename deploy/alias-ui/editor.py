@@ -4,6 +4,7 @@ import base64
 import copy
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -22,6 +23,8 @@ ACCOUNT = Path("/var/run/secrets/kubernetes.io/serviceaccount")
 SECRET = "https://kubernetes.default.svc/api/v1/namespaces/svincolo/secrets/svincolo-config"
 DIGEST = Path("/run/operator/digest")
 NAME = re.compile(r"[a-z][a-z0-9_-]{0,62}")
+PROVIDERS = {"openai": ("OpenAI", "https://api.openai.com/v1"),
+             "anthropic": ("Anthropic", "https://api.anthropic.com/v1")}
 TIERS = {"low", "medium", "high"}
 MANAGED = {"structured_modes", "validation_retries", "default_max_tokens"}
 
@@ -30,11 +33,11 @@ class Invalid(ValueError):
     pass
 
 
-def route_index(config):
+def route_index(config, inactive=()):
     spunto = next(c for c in config["caller"] if c["name"] == "spunto")
     routes = {r["name"]: r for r in config["route"] if r["name"] in spunto["routes"]}
     targets = {k: r for k, r in routes.items() if "upstream_model" not in r
-               and r["surfaces"].get("chat") == "managed"}
+               and r["upstream"] not in inactive and r["surfaces"].get("chat") == "managed"}
     aliases = {k: r for k, r in routes.items() if "upstream_model" in r
                and r["surfaces"].get("chat") == "managed"}
     return spunto, targets, aliases
@@ -65,9 +68,9 @@ def callers_for(config, name):
     return [c["name"] for c in config["caller"] if name in c["routes"] or "*" in c["routes"]]
 
 
-def edit(text, action, name, model):
+def edit(text, action, name, model, inactive=()):
     config = tomllib.loads(text)
-    spunto, targets, aliases = route_index(config)
+    spunto, targets, aliases = route_index(config, inactive)
     existing = aliases.get(name)
     family = None
     if name in TIERS and action in ("create", "update") and not model.startswith("latest/"):
@@ -127,7 +130,7 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def kubernetes(patch=None):
+def kubernetes(patch=None, *, availability=False):
     tls = ssl.create_default_context(cafile=str(ACCOUNT / "ca.crt"))
     headers = {"Authorization": "Bearer " + (ACCOUNT / "token").read_text().strip()}
     if patch is not None:
@@ -137,8 +140,72 @@ def kubernetes(patch=None):
     with build_opener(NoRedirect(), HTTPSHandler(context=tls)).open(req, timeout=8) as res:
         if patch is None:
             secret = json.load(res)
-            return (secret["metadata"]["resourceVersion"],
-                    base64.b64decode(secret["data"]["svincolo.toml"]).decode())
+            data = secret["data"]
+            text = base64.b64decode(data["svincolo.toml"]).decode()
+            snapshot = (secret["metadata"]["resourceVersion"], text)
+            if availability:
+                config = tomllib.loads(text)
+                states = {u["name"]: "Key required" for u in config.get("upstream", [])
+                          if u["name"] in PROVIDERS}
+                for name, file in provider_key_files(config).items():
+                    value = base64.b64decode(data.get(file, "")).decode("ascii", errors="replace").strip()
+                    if value:
+                        states[name] = provider_status(name, value)
+                return (*snapshot, states)
+            return snapshot
+
+
+def provider_key_files(config):
+    # Only expose dedicated, flat Secret entries referenced by a configured upstream.
+    upstreams = config.get("upstream", [])
+    key_files = {}
+    for upstream in upstreams:
+        name = upstream["name"]
+        filename = upstream.get("key_file")
+        if (name not in PROVIDERS or upstream.get("base_url", "").rstrip("/") != PROVIDERS[name][1] or
+                upstream.get("key_env") or upstream.get("auth") == "none" or
+                filename != f"{name}.key" or
+                any(Path(row.get("key_file", "")).name == filename
+                    for row in [*config.get("caller", []), *upstreams] if row is not upstream)):
+            continue
+        key_files[name] = filename
+    return key_files
+
+
+def provider_status(provider, value):
+    if not re.fullmatch(r"[!-~]{1,1024}", value):
+        return "Invalid key"
+    headers = ({"Authorization": "Bearer " + value} if provider == "openai" else
+               {"x-api-key": value, "anthropic-version": "2023-06-01"})
+    request = Request(PROVIDERS[provider][1] + "/models", headers=headers)
+    try:
+        with build_opener(NoRedirect()).open(request, timeout=5) as response:
+            payload = response.read(2_097_153)
+            if len(payload) <= 2_097_152 and isinstance(json.loads(payload).get("data"), list):
+                return "Active"
+    except HTTPError as exc:
+        exc.close()
+        if exc.code in (401, 403):
+            return "Key rejected"
+    except (OSError, ValueError, AttributeError, http.client.HTTPException):
+        pass
+    return "Verification unavailable"
+
+
+def save_provider_key(config, revision, provider, value):
+    filename = provider_key_files(config).get(provider)
+    if filename is None:
+        raise Invalid("Choose a configured provider.")
+    if not re.fullmatch(r"[!-~]{1,1024}", value):
+        raise Invalid("Enter a single API key without spaces.")
+    status = provider_status(provider, value)
+    if status == "Verification unavailable":
+        raise OSError("Provider verification unavailable.")
+    if status != "Active":
+        raise Invalid("The provider rejected this key.")
+    kubernetes([{"op": "test", "path": "/metadata/resourceVersion", "value": revision},
+                {"op": "add", "path": "/data/" + filename,
+                 "value": base64.b64encode(value.encode("ascii")).decode("ascii")}])
 
 
 def scopes(config):
@@ -176,13 +243,24 @@ def budget_forms(config):
             + "".join(cards))
 
 
-def page(text, revision, notice=""):
+def page(text, revision, notice="", states=None):
     config = tomllib.loads(text)
-    _, targets, aliases = route_index(config)
+    states = states or {}
+    _, targets, aliases = route_index(config, {name for name, status in states.items() if status != "Active"})
     def fields(action, name=""):
         return (f'<input type="hidden" name="action" value="{action}">'
                 f'<input type="hidden" name="revision" value="{escape(revision, quote=True)}">'
                 + (f'<input type="hidden" name="name" value="{escape(name, quote=True)}">' if name else ""))
+    key_forms = []
+    for provider in sorted(provider_key_files(config)):
+        label = PROVIDERS[provider][0]
+        key_forms.append(f'<form method="post">{fields("provider_key", provider)}'
+                         f'<label>{escape(label)} API key · {escape(states.get(provider, "Key required"))}<input type="password" name="api_key" '
+                         'autocomplete="new-password" spellcheck="false" maxlength="1024" required></label>'
+                         '<button>Save key</button></form>')
+    keys_section = ('<section id="provider-keys"><h2>Provider API keys</h2>'
+                    '<p>Saving a key replaces the credential used for new requests to that provider.</p>'
+                    + "".join(key_forms) + "</section>") if key_forms else ""
     followers = {}
     for block in re.split(r"(?=^\[\[)", text, flags=re.M):
         following = re.search(r"^# svincolo-follow (sol|terra|haiku)$", block, re.M)
@@ -218,13 +296,13 @@ def page(text, revision, notice=""):
                      f'<form method="post">{fields("update", name)}{select(current, family_only=name in TIERS)}'
                      f'<button>Save destination</button></form>{remove}</section>')
     return rf"""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="icon" href="favicon.ico?v=2"><title>Aliases and spending caps · Svincolo</title><style>
+<link rel="icon" href="favicon.ico?v=2"><title>Operator settings · Svincolo</title><style>
 *{{box-sizing:border-box}}body{{background:#f5f3ed;color:#202720;font:16px/1.5 Inter,system-ui,sans-serif;margin:0}}main{{max-width:54rem;margin:auto;padding:2rem 1rem 4rem}}h1{{font-size:2.6rem;letter-spacing:-.05em;margin:.5rem 0}}h2{{font-size:1.15rem;margin:0}}section{{padding:1.25rem;background:#fff;border:1px solid #cdcfc4;border-radius:.6rem;margin-top:1rem}}p{{margin:.35rem 0 .8rem}}form{{display:flex;gap:.5rem;flex-wrap:wrap}}select,input,button{{font:inherit;padding:.55rem;border-radius:.35rem;border:1px solid #9ca79b;max-width:100%}}button{{background:#214b37;color:white;cursor:pointer}}label{{display:grid;gap:.2rem}}form{{align-items:end}}h3{{margin:.2rem 0}}#budgets{{margin-top:2rem}}summary{{cursor:pointer}}details{{margin-top:.65rem}}a{{color:#214b37}}[role=status]{{background:#e4ecdf;padding:.7rem}}
-</style><main><a href="{escape(os.environ.get('DASHBOARD_URL', '/'), quote=True)}">Svincolo dashboard</a><h1>Model aliases</h1><a href="#budgets">Spending caps</a>
+</style><main><a href="{escape(os.environ.get('DASHBOARD_URL', '/'), quote=True)}">Svincolo dashboard</a><h1>Model aliases</h1><a href="#budgets">Spending caps</a> {'<a href="#provider-keys">Provider API keys</a>' if key_forms else ''}
 <p>New aliases appear in Spunto. Saving a shared alias changes its destination for every app listed.</p>
 {('<p role="status">'+escape(notice)+'</p>') if notice else ''}
 <section><h2>Create an alias</h2><form method="post">{fields("create")}<input aria-label="Alias name" name="name" placeholder="Alias name" pattern="[a-z][a-z0-9_\-]{{0,62}}" required maxlength="63">{select()}<button>Create alias</button></form></section>
-{''.join(cards)}{budget_forms(config)}</main></html>"""
+{''.join(cards)}{keys_section}{budget_forms(config)}</main></html>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -270,9 +348,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         try:
-            rev, text = kubernetes()
+            rev, text, states = kubernetes(availability=True)
             self.send(200, page(text, rev, "Changes saved."
-                                if self.path == PATH + "?saved" else ""))
+                                if self.path == PATH + "?saved" else "", states))
         except (OSError, ValueError, KeyError):
             self.send(503, "Router configuration unavailable.")
 
@@ -289,7 +367,11 @@ class Handler(BaseHTTPRequestHandler):
             form = parse_qs(self.rfile.read(size).decode(), strict_parsing=True, keep_blank_values=True, max_num_fields=7)
             if any(len(v) != 1 for v in form.values()):
                 raise Invalid("Duplicate form field.")
-            rev, text = kubernetes()
+            if form.get("action") in (["update"], ["create"]):
+                rev, text, states = kubernetes(availability=True)
+            else:
+                rev, text = kubernetes()
+                states = {}
             if form.get("action") == ["budget"]:
                 import spend
                 scope, name = form["scope"][0], form["name"][0]
@@ -302,9 +384,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(303, Location=PATH + "?saved#budgets")
                 return
             if form.get("revision") != [rev]:
-                self.send(409, page(text, rev, "The catalog changed. Review the current values and submit again."))
+                self.send(409, "The catalog changed. Reload the editor and submit again.")
                 return
-            updated = edit(text, form["action"][0], form["name"][0], form.get("model", [""])[0])
+            if form.get("action") == ["provider_key"]:
+                save_provider_key(tomllib.loads(text), rev, form["name"][0], form["api_key"][0])
+                self.send(303, Location=PATH + "?saved#provider-keys")
+                return
+            updated = edit(text, form["action"][0], form["name"][0], form.get("model", [""])[0],
+                           {name for name, status in states.items() if status != "Active"})
             if updated != text:
                 kubernetes([{"op":"test", "path":"/metadata/resourceVersion", "value":rev},
                             {"op":"replace", "path":"/data/svincolo.toml",
