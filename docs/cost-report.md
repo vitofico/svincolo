@@ -3,8 +3,8 @@
 Export the router's stdout as JSONL and run the report locally with Python 3.
 It reads `managed_chat_usage` events for managed Chat Completions and
 `native_usage` events for Anthropic Messages, OpenAI Responses, embeddings,
-and audio transcriptions. Raw Chat Completions and requests rejected before
-upstream dispatch are outside its coverage.
+audio transcriptions, and image generation. Raw Chat Completions and requests
+rejected before upstream dispatch are outside its coverage.
 
 Managed Chat Completions may make several attempts, such as structured output
 repairs. Native usage comes from successful uncompressed JSON or SSE responses.
@@ -13,7 +13,8 @@ response prevents observation of final usage, or when observation memory is
 unavailable. JSON inspection is capped at 512 KiB, or 1 MiB for embeddings.
 SSE inspection caps each line and each event's data at 512 KiB. These limits
 apply to usage inspection. The router continues forwarding the upstream body
-to the client.
+to the client. For image generation, inspection keeps only the start of each
+long string, so base64 image data does not count toward the cap.
 
 Estimates cover token and duration charges. Provider-hosted tools, storage,
 and other per-use fees are billed separately.
@@ -103,6 +104,19 @@ If the only measurement is token usage, a duration-priced attempt is
 unpriced. OpenAI lists GPT-Transcribe at $0.0045 per minute. [OpenAI model
 pricing](https://developers.openai.com/api/docs/models/gpt-transcribe)
 
+Image generation events with `"surface":"images"` record the text input and
+text output tokens from the provider's `usage` in `input_tokens` and
+`output_tokens`, and its image tokens in `image_input_tokens` and
+`image_output_tokens`. When the provider does not split output tokens, the
+router counts them all as image output. Without an input breakdown, it counts
+all input as text. OpenAI does not report cached tokens for image generation,
+so the router records none, and any cached input is priced at the full input
+rate. Add `image_input_tokens` and
+`image_output_tokens` rates in USD per million tokens to the standard
+four-rate row. An image attempt is unpriced when its model has no image
+rates. An answer without token usage, such as one from a model billed per
+image, counts as unknown usage.
+
 Pass zero or more log paths. With no paths, the report reads stdin, and
 `-` reads stdin alongside files. Input can contain other router events.
 Matching usage events are counted once per request ID across all input
@@ -126,6 +140,8 @@ one unknown usage attempt, zero unpriced attempts, and a
   audio input tokens, provider-reported duration, and uploaded duration.
   `upload_duration_priced_attempts` counts attempts priced using measured
   uploaded duration.
+- The final `image_input_tokens` and `image_output_tokens` fields total the
+  image token counts.
 
 The report uses operator-supplied rates and usage seen by the router.
 Provider invoices may include additional charges, discounts, or requests

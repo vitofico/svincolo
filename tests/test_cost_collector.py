@@ -133,11 +133,18 @@ class CollectorTest(unittest.TestCase):
                    input_tokens=0, known_attempts=0)
             + line("invalid", event="native_usage", surface="embeddings",
                    audio_input_tokens=0)
+            + line("image", event="native_usage", surface="images",
+                   image_input_tokens=0, image_output_tokens=1040)
+            + line("image-missing", event="native_usage", surface="images",
+                   image_input_tokens=0)
+            + line("image-misplaced", event="native_usage", surface="embeddings",
+                   image_output_tokens=1)
         )
         self.assertEqual(collector.collect(self.db, api), [])
         rows = {request: json.loads(event) for request, event in
                 self.db.execute("SELECT request_id, event FROM usage")}
-        self.assertEqual(set(rows), {"embed", "tokens", "seconds", "unknown"})
+        self.assertEqual(set(rows), {"embed", "tokens", "seconds", "unknown", "image"})
+        self.assertEqual(rows["image"]["image_output_tokens"], 1040)
         self.assertEqual(rows["tokens"]["audio_input_tokens"], 0)
         self.assertEqual(rows["tokens"]["uploaded_audio_duration_ms"], 1000)
         self.assertEqual(rows["seconds"]["audio_duration_ms"], 0)

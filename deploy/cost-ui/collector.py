@@ -117,7 +117,7 @@ def usage_event(body):
     event = {"event": source["event"]}
     if event["event"] == "native_usage":
         surface = source.get("surface")
-        if surface not in ("messages", "responses", "embeddings", "transcriptions"):
+        if surface not in ("messages", "responses", "embeddings", "transcriptions", "images"):
             return None
         event["surface"] = surface
     for name in IDENTIFIERS:
@@ -148,6 +148,19 @@ def usage_event(body):
                 or (audio_input is None and any(event[name] for name in COUNTS[3:]))):
             return None
     elif any(name in event for name in audio_fields):
+        return None
+    image_fields = ("image_input_tokens", "image_output_tokens")
+    for name in image_fields:
+        if name in source:
+            value = source[name]
+            if type(value) is not int or value < 0:
+                return None
+            event[name] = value
+    present = [name in event for name in image_fields]
+    if event.get("surface") == "images" and event["known_attempts"]:
+        if not all(present):
+            return None
+    elif any(present):
         return None
     return event
 
