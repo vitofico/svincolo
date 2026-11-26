@@ -135,7 +135,12 @@ impl Surface {
     }
 
     fn compatible_with(self, kind: UpstreamKind) -> bool {
-        (self == Self::Messages) == matches!(kind, UpstreamKind::Anthropic)
+        match self {
+            Self::Messages => matches!(kind, UpstreamKind::Anthropic),
+            // Ollama's OpenAI-compatible API documents no images endpoint.
+            Self::Images => matches!(kind, UpstreamKind::Openai | UpstreamKind::OpenaiCompatible),
+            _ => !matches!(kind, UpstreamKind::Anthropic),
+        }
     }
 }
 
@@ -1272,6 +1277,8 @@ routes = ["test:1"]
             "kind = \"anthropic\"\nauth = \"none\"",
         );
         assert!(invalid(&anthropic, directory).contains(".surfaces"));
+        let ollama = text.replace("kind = \"openai_compatible\"", "kind = \"ollama\"");
+        assert!(invalid(&ollama, directory).contains(".surfaces"));
         let managed = text.replace("images = \"raw\"", "images = \"managed\"");
         invalid(&managed, directory);
     }

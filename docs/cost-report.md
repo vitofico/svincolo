@@ -3,8 +3,8 @@
 Export the router's stdout as JSONL and run the report locally with Python 3.
 It reads `managed_chat_usage` events for managed Chat Completions and
 `native_usage` events for Anthropic Messages, OpenAI Responses, embeddings,
-audio transcriptions, and image generation. Raw Chat Completions and requests rejected before
-upstream dispatch are outside its coverage.
+audio transcriptions, and image generation. Raw Chat Completions and requests
+rejected before upstream dispatch are outside its coverage.
 
 Managed Chat Completions may make several attempts, such as structured output
 repairs. Native usage comes from successful uncompressed JSON or SSE responses.
@@ -108,7 +108,10 @@ Image generation events with `"surface":"images"` record the text input and
 text output tokens from the provider's `usage` in `input_tokens` and
 `output_tokens`, and its image tokens in `image_input_tokens` and
 `image_output_tokens`. When the provider does not split output tokens, the
-router counts them all as image output. Add `image_input_tokens` and
+router counts them all as image output. Without an input breakdown, it counts
+all input as text. OpenAI does not report cached tokens for image generation,
+so the router records none, and any cached input is priced at the full input
+rate. Add `image_input_tokens` and
 `image_output_tokens` rates in USD per million tokens to the standard
 four-rate row. An image attempt is unpriced when its model has no image
 rates. An answer without token usage, such as one from a model billed per

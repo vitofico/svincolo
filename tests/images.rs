@@ -358,6 +358,47 @@ async fn ungranted_callers_and_mismatched_routes_never_reach_the_provider() {
 }
 
 #[tokio::test]
+async fn streamed_or_partial_image_requests_are_refused_before_dispatch() {
+    let mut fixture = Fixture::start([]).await;
+    for options in [
+        r#""stream":true"#,
+        r#""partial_images":2"#,
+        r#""stream":true,"partial_images":1"#,
+    ] {
+        let body = REQUEST.replace("\"n\":1", options);
+        expect_error(
+            fixture.post(IMAGES, APP_KEY, &body).await,
+            400,
+            "streaming_unsupported",
+        )
+        .await;
+    }
+    let repeated = REQUEST.replace("\"n\":1", r#""stream":false,"stream":true"#);
+    expect_error(
+        fixture.post(IMAGES, APP_KEY, &repeated).await,
+        415,
+        "body_not_json",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fixture.no_more_calls();
+    assert!(fixture.events().is_empty());
+}
+
+#[tokio::test]
+async fn non_streaming_options_are_forwarded_unchanged() {
+    let usage = json!({"input_tokens":1,"output_tokens":1});
+    let mut fixture = Fixture::start([(200, answer("aGVsbG8=", &usage))]).await;
+    let body = REQUEST.replace("\"n\":1", r#""n":1,"stream":false,"partial_images":0"#);
+    let response = fixture.post(IMAGES, APP_KEY, &body).await;
+    assert_eq!(response.status().as_u16(), 200);
+    response.bytes().await.unwrap();
+    let seen = fixture.seen().await;
+    assert_eq!(seen.body["stream"], false);
+    assert_eq!(seen.body["partial_images"], 0);
+}
+
+#[tokio::test]
 async fn provider_refusal_passes_through_and_counts_an_unknown_attempt() {
     let refusal = json!({"error":{"message":"Rejected by the safety system.","type":"image_generation_user_error","code":"moderation_blocked"}}).to_string();
     let mut fixture = Fixture::start([(400, refusal.clone())]).await;

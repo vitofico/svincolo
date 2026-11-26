@@ -473,6 +473,11 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
     ) {
         return meta.error(fault);
     }
+    if surface == Surface::Images
+        && let Err(fault) = refuse_image_streaming(&body)
+    {
+        return meta.error(fault);
+    }
     let cloud = (route.locality == Locality::Cloud).then_some(&snapshot.cloud);
     if *drain.borrow() {
         return meta.error(DRAINING);
@@ -678,6 +683,30 @@ fn outbound_body(
         len,
         rewritten: true,
     })
+}
+
+/// Streamed image answers carry usage in events the router does not read, so
+/// they would escape cost records and spending caps.
+fn refuse_image_streaming(body: &[u8]) -> Result<(), Fault> {
+    #[derive(serde::Deserialize)]
+    struct Options {
+        stream: Option<serde_json::Value>,
+        partial_images: Option<serde_json::Value>,
+    }
+    // A repeated field fails here, so the provider cannot read a different value.
+    let options: Options = serde_json::from_slice(body).map_err(|_| BAD_BODY)?;
+    let streamed = options.stream == Some(serde_json::Value::Bool(true));
+    let partial = options
+        .partial_images
+        .is_some_and(|value| !value.is_null() && value != 0);
+    if streamed || partial {
+        return Err(Fault::local(
+            400,
+            "streaming_unsupported",
+            "Image generation is forwarded only without streaming or partial images.",
+        ));
+    }
+    Ok(())
 }
 
 async fn cloud_cancelled(cloud: Option<&CancellationToken>) {

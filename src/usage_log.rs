@@ -121,7 +121,14 @@ impl NativeUsageEvent {
             return;
         }
         // Observation can never exhaust the router's admission budget or prevent forwarding.
-        let Some(permit) = budget.reserve(2 * MAX_BUFFER_BYTES, limit.min(8 * 1024 * 1024)) else {
+        // Image answers use one trimmed JSON buffer. Others may need two for SSE.
+        let buffers = if self.surface == Surface::Images {
+            1
+        } else {
+            2
+        };
+        let Some(permit) = budget.reserve(buffers * MAX_BUFFER_BYTES, limit.min(8 * 1024 * 1024))
+        else {
             return;
         };
         let content_type = headers

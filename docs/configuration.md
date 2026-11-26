@@ -122,13 +122,15 @@ the default 16 MiB. The limit includes multipart framing.
 
 ## Image generation
 
-Enable `surfaces = { images = "raw" }` on a route with an OpenAI or
-OpenAI-compatible upstream. Clients send `POST /v1/images/generations` with a
+Enable `surfaces = { images = "raw" }` on a route with an `openai` or
+`openai_compatible` upstream. Ollama's OpenAI-compatible API documents no
+images endpoint, so `ollama` upstreams are refused. Clients send `POST /v1/images/generations` with a
 JSON body. The router replaces `model` with the route's pinned model ID and
 forwards the other fields unchanged to the upstream's `images/generations`
 endpoint. It returns the provider's answer as it arrives, including base64
 image data of several megabytes. The router waits up to five minutes for the
-complete answer.
+complete answer, and that deadline covers every image a request asks for, so
+keep `n` small.
 
 ```toml
 [[upstream]]
@@ -153,8 +155,16 @@ routes = ["cover-art"]
 Sending a model without the images surface to this path returns 404
 `capability_unavailable`, as does sending an image route to another API.
 Caller permissions, rate limits, queues and spending caps apply as they do to
-other requests. The router forwards only image generation. Image edits,
-variations and streamed partial images are not routed.
+other requests. The router forwards only image generation. Image edits and
+variations are not routed. A request with `"stream": true` or a nonzero
+`partial_images` returns 400 `streaming_unsupported` before the provider is
+contacted.
+
+Spending caps count only priced usage. An image request is logged with unknown
+usage, and does not count toward a cap, when its answer carries no token
+usage. That happens with models billed per image, when the caller disconnects
+before the answer completes, and when the router has no observation memory
+to spare. Check the cost report's unknown usage count for these requests.
 
 ## Managed chat
 

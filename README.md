@@ -16,9 +16,9 @@ and model ID. If an app switches tiers through a single API, give those routes
 the same API surface. [Configure model tiers and discovery](docs/configuration.md#model-tiers-and-discovery).
 
 - **Native API forwarding.** Use Chat Completions, Responses, embeddings, audio
-  transcriptions, image generation, and Anthropic Messages. Raw routes send the pinned model ID
-  upstream and return provider-native responses. Streaming chat, Responses,
-  and Messages can pass through as streams.
+  transcriptions, image generation, and Anthropic Messages. Raw routes send
+  the pinned model ID upstream and return provider-native responses.
+  Streaming chat, Responses, and Messages can pass through as streams.
 - **Validated structured output.** Managed Chat supports one non-streaming
   answer without tools on Anthropic, OpenAI, and Ollama. Structured answers
   are checked against the caller's original schema.

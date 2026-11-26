@@ -36,7 +36,7 @@ enum Body {
     Ignore,
     Json(Vec<u8>),
     // Image answers carry megabytes of base64, so long strings are cut short.
-    Images(Vec<u8>, Strings),
+    Images(Vec<u8>, LongStringTrimmer),
     Events(Events),
 }
 
@@ -48,7 +48,7 @@ impl NativeUsage {
             Body::Ignore
         } else if surface == Surface::Images {
             if json {
-                Body::Images(Vec::new(), Strings::default())
+                Body::Images(Vec::new(), LongStringTrimmer::default())
             } else {
                 Body::Ignore
             }
@@ -80,8 +80,8 @@ impl NativeUsage {
                     self.body = Body::Ignore;
                 }
             }
-            Body::Images(buffer, strings) => {
-                if !strings.feed(buffer, bytes) {
+            Body::Images(buffer, trimmer) => {
+                if !trimmer.feed(buffer, bytes) {
                     self.body = Body::Ignore;
                 }
             }
@@ -92,19 +92,16 @@ impl NativeUsage {
 
     pub fn finish(&mut self) -> Option<Units> {
         match &mut self.body {
-            Body::Json(buffer) => {
+            Body::Json(buffer) | Body::Images(buffer, _) => {
                 let envelope: UsageEnvelope<'_> = serde_json::from_slice(buffer).ok()?;
                 match self.surface {
                     Surface::Embeddings => decode::<EmbeddingUsage>(envelope.usage)?.units(),
                     Surface::Transcriptions => {
                         decode::<TranscriptionUsage>(envelope.usage)?.units()
                     }
+                    Surface::Images => decode::<ImageUsage>(envelope.usage)?.units(),
                     _ => usage(self.surface, envelope).map(Units::from),
                 }
-            }
-            Body::Images(buffer, _) => {
-                let envelope: UsageEnvelope<'_> = serde_json::from_slice(buffer).ok()?;
-                decode::<ImageUsage>(envelope.usage)?.units()
             }
             _ => self.terminal(),
         }
@@ -136,10 +133,10 @@ impl NativeUsage {
 
 /// Copies JSON while keeping only the first bytes of each long string, so an
 /// image answer's usage can be read without holding its base64 data. A string
-/// is only cut before a plain ASCII character outside an escape, so the copy
-/// stays valid JSON and valid UTF-8.
+/// is only cut outside an escape, before a byte that starts a character and is
+/// not a backslash, so the copy stays valid JSON and valid UTF-8.
 #[derive(Default)]
-struct Strings {
+struct LongStringTrimmer {
     open: bool,
     escaped: bool,
     hex_left: u8,
@@ -149,7 +146,7 @@ struct Strings {
 
 const KEPT_STRING_BYTES: usize = 256;
 
-impl Strings {
+impl LongStringTrimmer {
     fn feed(&mut self, buffer: &mut Vec<u8>, mut bytes: &[u8]) -> bool {
         while !bytes.is_empty() {
             if self.cut && !self.escaped && self.hex_left == 0 {
@@ -184,7 +181,9 @@ impl Strings {
                 self.escaped = true;
                 !self.cut
             } else {
-                if self.kept >= KEPT_STRING_BYTES && byte.is_ascii() {
+                // Backslashes never start a cut (see above), so a surrogate
+                // pair of escapes is kept or dropped whole.
+                if self.kept >= KEPT_STRING_BYTES && !is_continuation(byte) {
                     self.cut = true;
                 }
                 !self.cut
@@ -201,6 +200,10 @@ impl Strings {
         }
         true
     }
+}
+
+const fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
 }
 
 fn fits(buffer: &[u8], bytes: &[u8]) -> bool {
@@ -517,7 +520,7 @@ struct ImageUsage {
     input_tokens: u64,
     output_tokens: u64,
     total_tokens: Option<u64>,
-    input_tokens_details: Modalities,
+    input_tokens_details: Option<Modalities>,
     output_tokens_details: Option<Modalities>,
 }
 
@@ -536,7 +539,11 @@ impl ImageUsage {
             text_tokens: 0,
             image_tokens: self.output_tokens,
         });
-        let input = self.input_tokens_details;
+        // Without a breakdown, a generation's input is its text prompt.
+        let input = self.input_tokens_details.unwrap_or(Modalities {
+            text_tokens: self.input_tokens,
+            image_tokens: 0,
+        });
         if input.text_tokens.checked_add(input.image_tokens) != Some(self.input_tokens)
             || output.text_tokens.checked_add(output.image_tokens) != Some(self.output_tokens)
             || self.total_tokens.is_some_and(|total| {
@@ -788,9 +795,84 @@ mod tests {
     }
 
     #[test]
+    fn image_usage_without_breakdowns_is_text_in_and_image_out() {
+        let mut observer = NativeUsage::new(Surface::Images, "application/json");
+        observer
+            .feed(br#"{"data":[],"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}}"#);
+        assert_eq!(
+            observer.finish(),
+            Some(Units {
+                tokens: [5, 0, 0, 0],
+                image_input_tokens: Some(0),
+                image_output_tokens: Some(2),
+                ..Units::default()
+            })
+        );
+    }
+
+    fn trimmed(chunks: &[&[u8]]) -> Option<Vec<u8>> {
+        let mut trimmer = LongStringTrimmer::default();
+        let mut buffer = Vec::new();
+        for chunk in chunks {
+            if !trimmer.feed(&mut buffer, chunk) {
+                return None;
+            }
+        }
+        Some(buffer)
+    }
+
+    #[test]
+    fn trimming_is_independent_of_chunking_and_keeps_valid_json() {
+        let cjk = "漢字かな".repeat(100_000);
+        let long_escapes = format!("{}\\ud83d\\ude00\\\"\\u00e9 tail", "x".repeat(300));
+        let escapes_at_limit = format!("{}\\ud83d\\ude00{}", "y".repeat(255), "z".repeat(300));
+        let mut documents = vec![
+            format!(r#"{{"a":"{cjk}","usage":{{"n":1}}}}"#),
+            format!(r#"{{"b":["{long_escapes}","{escapes_at_limit}"],"k\"ey":"short"}}"#),
+            format!(r#"[{}"é{}"]"#, "\"\",".repeat(3), "é".repeat(400)),
+        ];
+        // Pseudo-random documents mixing escapes, multibyte text and plain bytes.
+        let mut seed = 0x9e37_79b9_u32;
+        let pieces = [
+            "a",
+            "\\\"",
+            "\\\\",
+            "\\u00e9",
+            "\\ud83d\\ude00",
+            "é",
+            "漢",
+            "😀",
+            "\\n",
+        ];
+        for _ in 0..200 {
+            let mut text = String::from("{\"s\":\"");
+            for _ in 0..(seed % 400) {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                text.push_str(pieces[(seed >> 16) as usize % pieces.len()]);
+            }
+            text.push_str("\",\"usage\":{\"n\":2}}");
+            documents.push(text);
+        }
+        for document in &documents {
+            let bytes = document.as_bytes();
+            serde_json::from_slice::<serde_json::Value>(bytes).expect("valid test document");
+            let whole = trimmed(&[bytes]).unwrap();
+            let single: Vec<&[u8]> = bytes.chunks(1).collect();
+            assert_eq!(trimmed(&single).unwrap(), whole);
+            let original: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let kept: serde_json::Value = serde_json::from_slice(&whole).expect("trimmed JSON");
+            assert!(whole.len() <= bytes.len());
+            if let Some(usage) = original.get("usage") {
+                assert_eq!(&kept["usage"], usage);
+            }
+        }
+        // The all-CJK string is cut, so its 1.2 MB never fill the buffer.
+        assert!(trimmed(&[documents[0].as_bytes()]).unwrap().len() < 400);
+    }
+
+    #[test]
     fn drops_inconsistent_or_incomplete_image_usage() {
         for usage in [
-            r#"{"input_tokens":5,"output_tokens":2}"#,
             r#"{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"text_tokens":4}}"#,
             r#"{"input_tokens":5,"output_tokens":2,"total_tokens":8,"input_tokens_details":{"text_tokens":5}}"#,
             r#"{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"text_tokens":5},"output_tokens_details":{"image_tokens":1}}"#,
