@@ -102,6 +102,7 @@ impl Upstream {
             Surface::Responses => &["responses"],
             Surface::Embeddings => &["embeddings"],
             Surface::Transcriptions => &["audio", "transcriptions"],
+            Surface::Images => &["images", "generations"],
         };
         url.path_segments_mut()
             .expect("validated HTTP base URL")
@@ -118,6 +119,7 @@ pub enum Surface {
     Responses,
     Embeddings,
     Transcriptions,
+    Images,
 }
 
 impl Surface {
@@ -128,6 +130,7 @@ impl Surface {
             Self::Responses => "responses",
             Self::Embeddings => "embeddings",
             Self::Transcriptions => "transcriptions",
+            Self::Images => "images",
         }
     }
 
@@ -357,6 +360,7 @@ struct Surfaces {
     responses: Option<RawMode>,
     embeddings: Option<RawMode>,
     transcriptions: Option<RawMode>,
+    images: Option<RawMode>,
 }
 
 impl Surfaces {
@@ -367,6 +371,7 @@ impl Surfaces {
             (Surface::Responses, self.responses.is_some()),
             (Surface::Embeddings, self.embeddings.is_some()),
             (Surface::Transcriptions, self.transcriptions.is_some()),
+            (Surface::Images, self.images.is_some()),
         ]
         .into_iter()
         .filter_map(|(surface, enabled)| enabled.then_some(surface))
@@ -1249,6 +1254,26 @@ routes = ["test:1"]
             .replace("chat = \"raw\"", "messages = \"raw\"")
             .replace("[[route]]", "anthropic_version = '2023-6-01'\n[[route]]");
         assert!(invalid(&malformed, directory).contains(".anthropic_version"));
+    }
+
+    #[test]
+    fn image_generation_uses_the_openai_images_endpoint() {
+        let directory = Path::new("");
+        let text = ROUTE.replace("chat = \"raw\"", "images = \"raw\"");
+        let config = Config::parse(&text, directory).unwrap();
+        let route = &config.routes["test:1"];
+        assert_eq!(route.surfaces, [Surface::Images]);
+        assert_eq!(
+            route.upstream.endpoint(Surface::Images).as_str(),
+            "http://127.0.0.1:9000/custom/v1/images/generations"
+        );
+        let anthropic = text.replace(
+            "kind = \"openai_compatible\"",
+            "kind = \"anthropic\"\nauth = \"none\"",
+        );
+        assert!(invalid(&anthropic, directory).contains(".surfaces"));
+        let managed = text.replace("images = \"raw\"", "images = \"managed\"");
+        invalid(&managed, directory);
     }
 
     #[test]

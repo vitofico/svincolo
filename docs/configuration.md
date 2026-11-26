@@ -88,7 +88,7 @@ A caller sends `"model": "low"` and the provider receives `llama3.2:1b`.
 Raw routes return the provider-native response, with router headers identifying
 the requested route and upstream model.
 
-`GET /v1/models` lists Chat Completions, Responses, embedding, and transcription routes.
+`GET /v1/models` lists Chat Completions, Responses, embedding, transcription, and image generation routes.
 `GET /anthropic/v1/models` lists native Messages routes. For Anthropic SDK
 discovery, use the router origin ending in `/anthropic` as the base URL. Send
 the usual caller token. Discovery filters configured routes by permissions and
@@ -119,6 +119,42 @@ Clients send a multipart form with one `model` field and one nonempty
 forwarding, accepts either part order, and preserves the audio bytes. Set
 `max_body_bytes = 33554432` under `[server]` if your uploads need more than
 the default 16 MiB. The limit includes multipart framing.
+
+## Image generation
+
+Enable `surfaces = { images = "raw" }` on a route with an OpenAI or
+OpenAI-compatible upstream. Clients send `POST /v1/images/generations` with a
+JSON body. The router replaces `model` with the route's pinned model ID and
+forwards the other fields unchanged to the upstream's `images/generations`
+endpoint. It returns the provider's answer as it arrives, including base64
+image data of several megabytes. The router waits up to five minutes for the
+complete answer.
+
+```toml
+[[upstream]]
+name = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+key_env = "OPENAI_API_KEY"
+
+[[route]]
+name = "cover-art"
+upstream = "openai"
+upstream_model = "gpt-image-1.5"
+locality = "cloud"
+surfaces = { images = "raw" }
+
+[[caller]]
+name = "example-app"
+key_file = "example-app.key"
+routes = ["cover-art"]
+```
+
+Sending a model without the images surface to this path returns 404
+`capability_unavailable`, as does sending an image route to another API.
+Caller permissions, rate limits, queues and spending caps apply as they do to
+other requests. The router forwards only image generation. Image edits,
+variations and streamed partial images are not routed.
 
 ## Managed chat
 

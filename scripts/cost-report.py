@@ -34,7 +34,10 @@ SURFACE_LABELS = {
     "responses": "OpenAI Responses",
     "embeddings": "Embeddings",
     "transcriptions": "Audio transcriptions",
+    "images": "Image generation",
 }
+
+IMAGE_FIELDS = ("image_input_tokens", "image_output_tokens")
 
 
 def read_prices(path):
@@ -83,10 +86,13 @@ class Price:
     long_rates: tuple = ()
     audio_input_rate: Optional[Fraction] = None
     audio_duration_rate: Optional[Fraction] = None
+    image_rates: tuple = ()
 
-    def cost(self, known, tokens, audio_input, duration, uploaded):
+    def cost(self, known, tokens, audio_input, duration, uploaded, images=None):
         if not known:
             return Fraction(0)
+        if images is not None and not self.image_rates:
+            return None
         measured = duration if duration is not None else uploaded
         if self.audio_duration_rate is not None:
             return None if measured is None else measured * self.audio_duration_rate
@@ -102,6 +108,8 @@ class Price:
         cost = sum(token * rate for token, rate in zip(tokens, rates))
         if audio_input is not None:
             cost += audio_input * self.audio_input_rate
+        if images is not None:
+            cost += sum(count * rate for count, rate in zip(images, self.image_rates))
         return cost
 
 
@@ -109,6 +117,11 @@ def parse_price(value):
     rates = dict(object_items(value))
     if set(rates) == {"audio_duration_usd_per_minute"}:
         return Price(audio_duration_rate=parse_rate(rates["audio_duration_usd_per_minute"], 60_000))
+    if any(name in rates for name in IMAGE_FIELDS):
+        if not all(name in rates for name in IMAGE_FIELDS) or "long_context" in rates:
+            raise ValueError("image pricing requires both image token rates and text token rates")
+        image_rates = tuple(parse_rate(rates.pop(name)) for name in IMAGE_FIELDS)
+        return Price(parse_token_rates(rates), image_rates=image_rates)
     audio_input_rate = None
     if "audio_input_tokens" in rates:
         audio_input_rate = parse_rate(rates.pop("audio_input_tokens"))
@@ -167,6 +180,8 @@ class Totals:
     uploaded_audio_duration_ms: int = 0
     uploaded_duration_attempts: int = 0
     upload_duration_priced_attempts: int = 0
+    image_input_tokens: int = 0
+    image_output_tokens: int = 0
 
     def add(self, row):
         for field in fields(self):
@@ -236,7 +251,16 @@ def summarize(paths, month, prices, date_range=None):
                             raise ValueError("inconsistent transcription usage measurements")
                     elif any(value is not None for value in (audio_input, duration, uploaded)):
                         raise ValueError("audio measurements require known transcription usage")
-                    signature = (timestamp, group, surface, attempts, known, tokens, audio_input, duration, uploaded)
+                    images = tuple(optional_count(event, name) for name in IMAGE_FIELDS)
+                    if surface == "images" and known:
+                        if None in images:
+                            raise ValueError("image usage requires image token counts")
+                    elif images != (None, None):
+                        raise ValueError("image token counts require known image usage")
+                    else:
+                        images = None
+                    signature = (timestamp, group, surface, attempts, known, tokens, audio_input, duration, uploaded,
+                                 images)
                     if request_id in seen:
                         if seen[request_id] != signature:
                             raise ValueError("conflicting events for the same request_id")
@@ -253,7 +277,7 @@ def summarize(paths, month, prices, date_range=None):
                 upload_priced = 0
                 if index >= 0:
                     price = history[index]
-                    estimate = price.cost(known, tokens, audio_input, duration, uploaded)
+                    estimate = price.cost(known, tokens, audio_input, duration, uploaded, images)
                     unpriced = known if estimate is None else 0
                     if estimate is not None:
                         cost = estimate
@@ -274,6 +298,7 @@ def summarize(paths, month, prices, date_range=None):
                     uploaded_audio_duration_ms=uploaded if uploaded is not None else 0,
                     uploaded_duration_attempts=known if uploaded is not None else 0,
                     upload_duration_priced_attempts=upload_priced,
+                    **dict(zip(IMAGE_FIELDS, images or (0, 0))),
                 ))
     return groups, malformed_lines, duplicates
 
@@ -338,6 +363,11 @@ def recorded_usage(surface, row):
             attempts = counted(row.upload_duration_priced_attempts, "attempt")
             values.append(f"{attempts} priced by upload duration")
         return "<br>".join(values)
+    if surface == "images":
+        return "<br>".join((f"{row.input_tokens:,} text input tokens",
+                            f"{row.image_input_tokens:,} image input tokens",
+                            f"{row.output_tokens:,} text output tokens",
+                            f"{row.image_output_tokens:,} image output tokens"))
     values = [f"{row.input_tokens:,} uncached input", f"{row.output_tokens:,} output"]
     if row.cache_read_input_tokens:
         values.append(f"{row.cache_read_input_tokens:,} cache read")
@@ -365,6 +395,7 @@ API_COLORS = {
     "responses": ("Responses", "#83b9ff"),
     "embeddings": ("Embeddings", "#f3cc75"),
     "transcriptions": ("Transcriptions", "#ff957b"),
+    "images": ("Images", "#e79bd8"),
 }
 APP_COLORS = [
     ("#e9e3ff", "#614aa1"), ("#ffe7d7", "#9b522e"),

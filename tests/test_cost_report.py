@@ -224,6 +224,48 @@ class CostReportTest(unittest.TestCase):
         self.assertIn('<td class="tokens">0 input tokens</td>', html.stdout)
         self.assertIn('<td class="tokens">Unknown</td>', html.stdout)
 
+    def test_image_token_rates_and_unpriced_image_usage(self):
+        table = json.loads(self.prices.read_text())
+        table["cloud"]["image-model"] = {"2026-11-01": {
+            **dict(zip(TOKEN_FIELDS, ("5", "1.25", "0", "10"))),
+            "image_input_tokens": "8",
+            "image_output_tokens": "32",
+        }}
+        self.prices.write_text(json.dumps(table))
+
+        def paint(request, model="image-model", **counts):
+            return usage(request, event="native_usage", surface="images",
+                         upstream_model=model, **counts)
+
+        image_counts = {"image_input_tokens": 0, "image_output_tokens": 1000}
+        events = jsonl(
+            paint("painted", input_tokens=100, output_tokens=0, **image_counts),
+            paint("no-usage", known_attempts=0),
+            paint("text-rates-only", "model", input_tokens=100, output_tokens=0, **image_counts),
+        )
+        report = self.run_report(events)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        rows = list(csv.DictReader(io.StringIO(report.stdout), delimiter="\t"))
+        painted = next(row for row in rows if row["upstream_model"] == "image-model")
+        self.assertEqual(painted["known_cost_usd"], "0.0325")
+        self.assertEqual(painted["image_output_tokens"], "1000")
+        self.assertEqual(painted["unknown_usage_attempts"], "1")
+        unpriced = next(row for row in rows if row["upstream_model"] == "model")
+        self.assertEqual(unpriced["unpriced_attempts"], "1")
+
+        html = self.run_report(events, html=True)
+        self.assertEqual(html.returncode, 0, html.stderr)
+        self.assertIn("<h3>Image generation</h3>", html.stdout)
+        self.assertIn("1,000 image output tokens", html.stdout)
+
+        for event in (paint("missing", input_tokens=1, output_tokens=0),
+                      usage("misplaced", event="native_usage", surface="embeddings", **image_counts)):
+            invalid = self.run_report(jsonl(event))
+            self.assertEqual(invalid.returncode, 2)
+        self.prices.write_text(json.dumps({"cloud": {"model": {"2026-11-01": {
+            **dict.fromkeys(TOKEN_FIELDS, "1"), "image_output_tokens": "1"}}}}))
+        self.assertIn("invalid rates", self.run_report().stderr)
+
     def test_html_empty_month(self):
         html = self.run_report("ignored startup line\n", html=True)
         self.assertEqual(html.returncode, 0, html.stderr)

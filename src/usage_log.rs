@@ -57,6 +57,8 @@ impl UsageIdentity {
             ("audio_input_tokens", units.audio_input_tokens),
             ("audio_duration_ms", units.audio_duration_ms),
             ("uploaded_audio_duration_ms", uploaded_ms),
+            ("image_input_tokens", units.image_input_tokens),
+            ("image_output_tokens", units.image_output_tokens),
         ] {
             if let Some(value) = value {
                 event[name] = value.into();

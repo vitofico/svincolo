@@ -214,6 +214,7 @@ async fn dispatch(app: Arc<App>, request: Request, peer: &ClientSocket) -> Respo
         (&Method::POST, "/v1/responses") => (Surface::Responses, false),
         (&Method::POST, "/v1/embeddings") => (Surface::Embeddings, false),
         (&Method::POST, "/v1/audio/transcriptions") => (Surface::Transcriptions, false),
+        (&Method::POST, "/v1/images/generations") => (Surface::Images, false),
         (&Method::POST, "/v1/messages" | "/anthropic/v1/messages") => (Surface::Messages, false),
         (&Method::GET, "/v1/models") => (Surface::Chat, true),
         (&Method::GET, "/anthropic/v1/models") => (Surface::Messages, true),

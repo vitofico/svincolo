@@ -16,7 +16,7 @@ and model ID. If an app switches tiers through a single API, give those routes
 the same API surface. [Configure model tiers and discovery](docs/configuration.md#model-tiers-and-discovery).
 
 - **Native API forwarding.** Use Chat Completions, Responses, embeddings, audio
-  transcriptions, and Anthropic Messages. Raw routes send the pinned model ID
+  transcriptions, image generation, and Anthropic Messages. Raw routes send the pinned model ID
   upstream and return provider-native responses. Streaming chat, Responses,
   and Messages can pass through as streams.
 - **Validated structured output.** Managed Chat supports one non-streaming
@@ -124,7 +124,8 @@ and cost. The coverage figures show attempts with missing usage or prices.
 ![Sample dashboard showing estimated monthly spend, cost by API, and apps ranked by spend.](docs/assets/cost-dashboard.jpg)
 
 Estimates use dated provider rates for managed Chat Completions, native
-Anthropic Messages and OpenAI Responses, embeddings, and audio transcriptions.
+Anthropic Messages and OpenAI Responses, embeddings, audio transcriptions,
+and token-billed image generation.
 Transcription charges can use audio duration or tokens, depending on the
 model. Raw Chat Completions are outside reporting coverage.
 

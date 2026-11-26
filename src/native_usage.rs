@@ -14,6 +14,8 @@ pub struct Units {
     pub tokens: Tokens,
     pub audio_input_tokens: Option<u64>,
     pub audio_duration_ms: Option<u64>,
+    pub image_input_tokens: Option<u64>,
+    pub image_output_tokens: Option<u64>,
 }
 
 impl From<Tokens> for Units {
@@ -33,15 +35,24 @@ pub struct NativeUsage {
 enum Body {
     Ignore,
     Json(Vec<u8>),
+    // Image answers carry megabytes of base64, so long strings are cut short.
+    Images(Vec<u8>, Strings),
     Events(Events),
 }
 
 impl NativeUsage {
     pub fn new(surface: Surface, content_type: &str) -> Self {
         let media_type = content_type.split(';').next().unwrap_or_default().trim();
+        let json = media_type.eq_ignore_ascii_case("application/json");
         let body = if surface == Surface::Chat {
             Body::Ignore
-        } else if media_type.eq_ignore_ascii_case("application/json") {
+        } else if surface == Surface::Images {
+            if json {
+                Body::Images(Vec::new(), Strings::default())
+            } else {
+                Body::Ignore
+            }
+        } else if json {
             Body::Json(Vec::new())
         } else if surface != Surface::Embeddings
             && media_type.eq_ignore_ascii_case("text/event-stream")
@@ -69,6 +80,11 @@ impl NativeUsage {
                     self.body = Body::Ignore;
                 }
             }
+            Body::Images(buffer, strings) => {
+                if !strings.feed(buffer, bytes) {
+                    self.body = Body::Ignore;
+                }
+            }
             Body::Events(events) => events.feed(self.surface, bytes),
             Body::Ignore => {}
         }
@@ -85,6 +101,10 @@ impl NativeUsage {
                     }
                     _ => usage(self.surface, envelope).map(Units::from),
                 }
+            }
+            Body::Images(buffer, _) => {
+                let envelope: UsageEnvelope<'_> = serde_json::from_slice(buffer).ok()?;
+                decode::<ImageUsage>(envelope.usage)?.units()
             }
             _ => self.terminal(),
         }
@@ -111,6 +131,75 @@ impl NativeUsage {
             }
             _ => false,
         }
+    }
+}
+
+/// Copies JSON while keeping only the first bytes of each long string, so an
+/// image answer's usage can be read without holding its base64 data. A string
+/// is only cut before a plain ASCII character outside an escape, so the copy
+/// stays valid JSON and valid UTF-8.
+#[derive(Default)]
+struct Strings {
+    open: bool,
+    escaped: bool,
+    hex_left: u8,
+    kept: usize,
+    cut: bool,
+}
+
+const KEPT_STRING_BYTES: usize = 256;
+
+impl Strings {
+    fn feed(&mut self, buffer: &mut Vec<u8>, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            if self.cut && !self.escaped && self.hex_left == 0 {
+                // Skip the rest of a cut string without copying it.
+                let Some(at) = memchr::memchr2(b'"', b'\\', bytes) else {
+                    return true;
+                };
+                bytes = &bytes[at..];
+            }
+            let byte = bytes[0];
+            bytes = &bytes[1..];
+            let keep = if !self.open {
+                if byte == b'"' {
+                    self.open = true;
+                    self.kept = 0;
+                }
+                true
+            } else if self.escaped {
+                self.escaped = false;
+                if byte == b'u' {
+                    self.hex_left = 4;
+                }
+                !self.cut
+            } else if self.hex_left > 0 {
+                self.hex_left -= 1;
+                !self.cut
+            } else if byte == b'"' {
+                self.open = false;
+                self.cut = false;
+                true
+            } else if byte == b'\\' {
+                self.escaped = true;
+                !self.cut
+            } else {
+                if self.kept >= KEPT_STRING_BYTES && byte.is_ascii() {
+                    self.cut = true;
+                }
+                !self.cut
+            };
+            if keep {
+                if buffer.len() >= MAX_BUFFER_BYTES {
+                    return false;
+                }
+                if self.open {
+                    self.kept += 1;
+                }
+                append(buffer, &[byte], MAX_BUFFER_BYTES);
+            }
+        }
+        true
     }
 }
 
@@ -424,6 +513,48 @@ impl EmbeddingUsage {
 }
 
 #[derive(Deserialize)]
+struct ImageUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: Option<u64>,
+    input_tokens_details: Modalities,
+    output_tokens_details: Option<Modalities>,
+}
+
+#[derive(Deserialize)]
+struct Modalities {
+    #[serde(default)]
+    text_tokens: u64,
+    #[serde(default)]
+    image_tokens: u64,
+}
+
+impl ImageUsage {
+    fn units(self) -> Option<Units> {
+        // Without a breakdown, an image model's output is the image itself.
+        let output = self.output_tokens_details.unwrap_or(Modalities {
+            text_tokens: 0,
+            image_tokens: self.output_tokens,
+        });
+        let input = self.input_tokens_details;
+        if input.text_tokens.checked_add(input.image_tokens) != Some(self.input_tokens)
+            || output.text_tokens.checked_add(output.image_tokens) != Some(self.output_tokens)
+            || self.total_tokens.is_some_and(|total| {
+                self.input_tokens.checked_add(self.output_tokens) != Some(total)
+            })
+        {
+            return None;
+        }
+        Some(Units {
+            tokens: [input.text_tokens, 0, 0, output.text_tokens],
+            image_input_tokens: Some(input.image_tokens),
+            image_output_tokens: Some(output.image_tokens),
+            ..Units::default()
+        })
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum TranscriptionUsage {
     Duration {
@@ -481,7 +612,7 @@ impl TranscriptionUsage {
                 Some(Units {
                     tokens: [text, 0, 0, output_tokens],
                     audio_input_tokens: Some(audio),
-                    audio_duration_ms: None,
+                    ..Units::default()
                 })
             }
         }
@@ -632,6 +763,49 @@ mod tests {
     }
 
     #[test]
+    fn reads_image_usage_after_megabytes_of_base64_and_escaped_text() {
+        let mut observer = NativeUsage::new(Surface::Images, "application/json");
+        let prompt = format!("{}\\\"\\u00e9\\ud83d\\ude00 é ", "\\\"x".repeat(200));
+        observer.feed(
+            format!(r#"{{"data":[{{"revised_prompt":"{prompt}{prompt}","b64_json":""#).as_bytes(),
+        );
+        for _ in 0..64 {
+            observer.feed(&[b'A'; 64 * 1024]);
+        }
+        let usage = r#"{"input_tokens":12,"output_tokens":20,"total_tokens":32,"input_tokens_details":{"text_tokens":9,"image_tokens":3}}"#;
+        for chunk in format!(r#"=="}}],"usage":{usage}}}"#).as_bytes().chunks(5) {
+            observer.feed(chunk);
+        }
+        assert_eq!(
+            observer.finish(),
+            Some(Units {
+                tokens: [9, 0, 0, 0],
+                image_input_tokens: Some(3),
+                image_output_tokens: Some(20),
+                ..Units::default()
+            })
+        );
+    }
+
+    #[test]
+    fn drops_inconsistent_or_incomplete_image_usage() {
+        for usage in [
+            r#"{"input_tokens":5,"output_tokens":2}"#,
+            r#"{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"text_tokens":4}}"#,
+            r#"{"input_tokens":5,"output_tokens":2,"total_tokens":8,"input_tokens_details":{"text_tokens":5}}"#,
+            r#"{"input_tokens":5,"output_tokens":2,"input_tokens_details":{"text_tokens":5},"output_tokens_details":{"image_tokens":1}}"#,
+        ] {
+            let mut observer = NativeUsage::new(Surface::Images, "application/json");
+            observer.feed(format!(r#"{{"data":[],"usage":{usage}}}"#).as_bytes());
+            assert_eq!(observer.finish(), None, "{usage}");
+        }
+        let mut observer = NativeUsage::new(Surface::Images, "text/event-stream");
+        observer
+            .feed(br#"{"usage":{"input_tokens":0,"output_tokens":0,"input_tokens_details":{}}}"#);
+        assert_eq!(observer.finish(), None);
+    }
+
+    #[test]
     fn reads_transcription_token_modalities_at_stream_end() {
         let mut observer = NativeUsage::new(Surface::Transcriptions, "text/event-stream");
         let data = concat!(
@@ -648,7 +822,7 @@ mod tests {
             Some(Units {
                 tokens: [2, 0, 0, 5],
                 audio_input_tokens: Some(12),
-                audio_duration_ms: None,
+                ..Units::default()
             })
         );
 
